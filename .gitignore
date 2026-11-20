@@ -1,0 +1,20 @@
+# Credentials & Certificates
+.env
+*.pfx
+*.p12
+
+# Runtime logs & generated data
+shioaji.log
+*.log
+data/cache/*
+!data/cache/.gitkeep
+data/reports/*
+!data/reports/.gitkeep
+config/watchlists/*
+!config/watchlists/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/

@@ -1,0 +1,32 @@
+# 台股與美股 VCP / SEPA 系統參數設定檔
+markets:
+  US:
+    benchmark: "QQQ"
+    alt_benchmark: "SPY"
+    ma:
+      short: 50
+      mid: 150
+      long: 200
+    screener_engine: "tradingview_mcp"
+    history_engine: "futu_mcp"
+    intraday_engine: "futu_mcp"
+    intraday_volume_estimate_delay_minutes: 15
+    earnings_warning_days: 7
+    risk:
+      max_stop_loss_pct: 8.0
+      account_risk_per_trade_pct: 1.0
+
+  TW:
+    benchmark: "^TWII"
+    ma:
+      short: 60
+      mid: 120
+      long: 240
+    screener_engine: "tradingview_mcp"
+    history_engine: "tradingview_mcp"  # 必須使用還原權息歷史日K
+    intraday_engine: "shioaji_mcp"
+    chips_engine: "tw_chips_fetcher"
+    intraday_volume_estimate_delay_minutes: 5
+    risk:
+      max_stop_loss_pct: 8.0
+      account_risk_per_trade_pct: 1.0
