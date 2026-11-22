@@ -43,8 +43,15 @@ function formatGate3Note(market: string, g3: Record<string, any>): string {
   if (!g3) return '';
   if (market === 'TW') {
     const parts: string[] = [];
-    const inst = g3.institutional_5d_lots || g3.institutional_1d_lots;
-    const label = g3.institutional_5d_lots ? '5D' : '1D';
+    let inst = g3.institutional_1d_lots;
+    let label = '1D';
+    if (g3.institutional_10d_lots) {
+      inst = g3.institutional_10d_lots;
+      label = '10D';
+    } else if (g3.institutional_5d_lots) {
+      inst = g3.institutional_5d_lots;
+      label = '5D';
+    }
     if (inst) {
       const t = Number(inst.trust || 0);
       const f = Number(inst.foreign || 0);
@@ -71,7 +78,37 @@ function formatGate3Note(market: string, g3: Record<string, any>): string {
   return parts.join(' | ');
 }
 
-export function formatPostMarketSummary(report: PostMarketScanReport, topN = 10): string {
+function cleanSymbol(symbol: string): string {
+  return String(symbol || '').split('.')[0].trim();
+}
+
+function yahooChartUrl(symbol: string, market: string, exchange = ''): string {
+  const sym = cleanSymbol(symbol);
+  let ticker = sym;
+  if (String(market || '').toUpperCase() === 'TW') {
+    const ex = String(exchange || '').trim().toUpperCase();
+    const suffix = ex === 'TPEX' || ex === 'OTC' || ex === 'TWO' ? '.TWO' : '.TW';
+    ticker = `${sym}${suffix}`;
+  }
+  return `https://tw.stock.yahoo.com/quote/${encodeURIComponent(ticker)}/technical-analysis`;
+}
+
+function wantgooChartUrl(symbol: string): string {
+  const sym = cleanSymbol(symbol);
+  return `https://www.wantgoo.com/stock/${encodeURIComponent(sym)}/technical-chart`;
+}
+
+function formatSymbolLinks(rawSym: string, titleLabel: string, market: string, exchange = ''): string {
+  const yahooUrl = escapeHtml(yahooChartUrl(rawSym, market, exchange)).replace(/"/g, '&quot;');
+  let linked = `<a href="${yahooUrl}"><b>${titleLabel}</b></a>`;
+  if (String(market || '').toUpperCase() === 'TW') {
+    const wgUrl = escapeHtml(wantgooChartUrl(rawSym)).replace(/"/g, '&quot;');
+    linked += ` [<a href="${wgUrl}">玩股K線</a>]`;
+  }
+  return linked;
+}
+
+export function formatPostMarketSummary(report: PostMarketScanReport, topN?: number): string {
   const market = report.market;
   const bm = escapeHtml(report.benchmark_symbol);
   const trend = escapeHtml(report.benchmark_trend);
@@ -94,29 +131,48 @@ export function formatPostMarketSummary(report: PostMarketScanReport, topN = 10)
     return lines.join('\n');
   }
 
+  const shownItems = topN === undefined ? report.focus_list : report.focus_list.slice(0, topN);
   lines.push('');
-  for (const item of report.focus_list.slice(0, topN)) {
-    const sym = escapeHtml(item.symbol);
+  for (const item of shownItems) {
+    const rawSym = String(item.symbol || '');
+    const sym = escapeHtml(rawSym);
     const nameZh = (item.name_zh || '').trim();
     const titleLabel = nameZh ? `${sym} ${escapeHtml(nameZh)}` : sym;
+    const titleHtml = formatSymbolLinks(rawSym, titleLabel, market, item.exchange || '');
     const g2 = item.metrics.gate2_trend_rs;
     const g3 = item.metrics.gate3_catalysts;
     const g4 = item.metrics.gate4_setup_risk;
 
     const bbwStr = `BBW ${g4.bbw_120d_percentile.toFixed(0)}%`;
-    const rs52 = g2.rs_line_52w_high ? 'RS新高' : 'RS-';
+    const rsRating = item.rs_rating ?? g2.rs_rating;
+    const rsStr =
+      rsRating != null
+        ? `RS${Math.round(rsRating)}${g2.rs_line_52w_high ? '新高' : ''}`
+        : g2.rs_line_52w_high
+          ? 'RS新高'
+          : 'RS-';
+
+    const vcpTier = String(item.vcp_tier || '').trim();
+    const tierPrefix = vcpTier ? `${escapeHtml(vcpTier)}級/` : '';
+    const setupStatus = String(item.setup_status || g4.setup_status || '').trim();
+    let statusBadge = '';
+    if (setupStatus === 'BREAKOUT') statusBadge = ' 🔥BREAKOUT';
+    else if (setupStatus === 'PIVOT_READY') statusBadge = ' 🎯PIVOT_READY';
+
+    const distP = item.dist_to_pivot_pct ?? g4.dist_to_pivot_pct;
+    const distStr = distP != null ? ` (距Pivot ${Number(distP) >= 0 ? '+' : ''}${Number(distP).toFixed(1)}%)` : '';
     const g3Note = formatGate3Note(market, g3);
 
     lines.push(
-      `<b>${item.rank}. ${titleLabel}</b> [${escapeHtml(item.focus_grade)}] ${item.vcp_score}分 | ` +
-        `收 ${item.close_price.toFixed(2)} / Pivot ${item.suggested_pivot.toFixed(2)} / Stop ${item.stop_loss_pct.toFixed(1)}% | ${bbwStr} ${rs52}`
+      `<b>${item.rank}.</b> ${titleHtml}${statusBadge} [${tierPrefix}${escapeHtml(item.focus_grade)}] ${item.vcp_score}分 | ` +
+        `收 ${item.close_price.toFixed(2)} / Pivot ${item.suggested_pivot.toFixed(2)}${distStr} / Stop ${item.stop_loss_pct.toFixed(1)}% | ${bbwStr} ${rsStr}`
     );
     if (g3Note) {
       lines.push(`   └ ${escapeHtml(g3Note)}`);
     }
   }
 
-  if (report.focus_list.length > topN) {
+  if (topN !== undefined && report.focus_list.length > topN) {
     lines.push(`\n…其餘 ${report.focus_list.length - topN} 檔請見 Focus List`);
   }
 
@@ -126,6 +182,7 @@ export function formatPostMarketSummary(report: PostMarketScanReport, topN = 10)
 export function formatIntradayBreakoutAlert(alert: {
   symbol: string;
   market: string;
+  exchange?: string;
   name_zh?: string;
   last_price: number;
   suggested_pivot: number;
@@ -135,14 +192,17 @@ export function formatIntradayBreakoutAlert(alert: {
   suggested_shares?: number;
   risk_amount?: number;
 }): string {
-  const sym = escapeHtml(alert.symbol);
-  const market = escapeHtml(alert.market || 'TW');
+  const rawSym = String(alert.symbol || '');
+  const rawMarket = String(alert.market || 'TW');
+  const sym = escapeHtml(rawSym);
+  const market = escapeHtml(rawMarket);
   const nameZh = (alert.name_zh || '').trim();
   const titleLabel = `${market}:${sym}` + (nameZh ? ` ${escapeHtml(nameZh)}` : '');
+  const titleHtml = formatSymbolLinks(rawSym, titleLabel, rawMarket, alert.exchange || '');
   const volStr = alert.est_vol_ratio_50d !== null ? `${alert.est_vol_ratio_50d.toFixed(2)}x` : '-';
 
   const lines = [
-    `🚨 <b>[VCP 樞紐突破警報] ${titleLabel}</b>`,
+    `🚨 <b>[VCP 樞紐突破警報]</b> ${titleHtml}`,
     `• 現價：<b>${alert.last_price.toFixed(2)}</b>（Pivot ${alert.suggested_pivot.toFixed(2)}）`,
     `• 預估全日量比：<b>${volStr}</b>（50 日均量基準）`,
   ];

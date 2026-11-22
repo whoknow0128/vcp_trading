@@ -457,16 +457,22 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                     const g4 = item.metrics.gate4_setup_risk;
 
                     const signals: string[] = [];
+                    const rsVal = item.rs_rating ?? g2.rs_rating;
+                    if (rsVal != null) signals.push(`RS ${Math.round(rsVal)}`);
                     if (g2.rs_line_52w_high) signals.push('RS 52週新高');
-                    if (g4.is_vdu_3d) signals.push('極度量縮 VDU');
+                    if (g4.is_vdu_5d || g4.is_vdu_3d) signals.push('極度量縮 VDU');
                     if (g4.pocket_pivot_in_5d) signals.push('口袋支點');
                     if (item.warnings.includes('EARNINGS_WARNING')) signals.push('財報≤7日');
 
+                    const instTw = g3.institutional_10d_lots || g3.institutional_5d_lots || g3.institutional_1d_lots;
+                    const instLabel = g3.institutional_10d_lots ? '10D' : g3.institutional_5d_lots ? '5D' : '1D';
                     const catalystNote =
                       market === 'TW'
                         ? g3.monthly_revenue?.yoy_pct != null
                           ? `月營收 YoY ${g3.monthly_revenue.yoy_pct > 0 ? '+' : ''}${g3.monthly_revenue.yoy_pct}%`
-                          : null
+                          : instTw
+                            ? `${instLabel}投信${instTw.trust >= 0 ? '+' : ''}${instTw.trust}/外資${instTw.foreign >= 0 ? '+' : ''}${instTw.foreign}張`
+                            : null
                         : g3.eps_yoy_fq_pct != null
                           ? `EPS YoY ${g3.eps_yoy_fq_pct > 0 ? '+' : ''}${g3.eps_yoy_fq_pct}%`
                           : null;
@@ -500,7 +506,19 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                           </button>
                         </td>
                         <td className="py-3 px-3 whitespace-nowrap">
-                          <span className={grade.colorClass}>{grade.label}</span>
+                          <div className="flex items-center gap-1.5">
+                            {item.vcp_tier && (
+                              <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-900 text-white">
+                                {item.vcp_tier}級
+                              </span>
+                            )}
+                            <span className={grade.colorClass}>{grade.label}</span>
+                            {item.setup_status && (item.setup_status === 'BREAKOUT' || item.setup_status === 'PIVOT_READY') && (
+                              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-semibold">
+                                {item.setup_status}
+                              </span>
+                            )}
+                          </div>
                           {catalystNote && (
                             <div className="text-[11px] text-slate-500 font-mono mt-0.5">{catalystNote}</div>
                           )}

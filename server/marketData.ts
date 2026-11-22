@@ -200,6 +200,7 @@ function parseTvRows(rows: any[], cols: string[], isUs: boolean): ScreenerCandid
       price_52w_low: m.price_52_week_low != null ? Number(m.price_52_week_low) : null,
       avg_vol_30d: m.average_volume_30d_calc != null ? Number(m.average_volume_30d_calc) : null,
       value_traded: m['Value.Traded'] != null ? Number(m['Value.Traded']) : null,
+      perf_3m: m['Perf.3M'] != null ? Number(m['Perf.3M']) : null,
       rel_vol_10d: m.relative_volume_10d_calc != null ? Number(m.relative_volume_10d_calc) : null,
       next_earnings_date: nextEarningsDate,
       eps_yoy_fq: isUs && m.earnings_per_share_diluted_yoy_growth_fq != null
@@ -225,7 +226,7 @@ async function postTvScan(scannerMarket: 'america' | 'taiwan', payload: Record<s
   );
 }
 
-export async function runStage2Screener(market: MarketType, limit = 40): Promise<ScreenerCandidate[]> {
+export async function runStage2Screener(market: MarketType, limit = 150): Promise<ScreenerCandidate[]> {
   const cacheKey = `${market}:${limit}`;
   const cached = getCache(screenerCache, cacheKey);
   if (cached) return cached;
@@ -247,6 +248,7 @@ export async function runStage2Screener(market: MarketType, limit = 40): Promise
       'price_52_week_low',
       'average_volume_30d_calc',
       'Value.Traded',
+      'Perf.3M',
       'relative_volume_10d_calc',
       'earnings_release_next_date',
       'earnings_per_share_diluted_yoy_growth_fq',
@@ -265,8 +267,8 @@ export async function runStage2Screener(market: MarketType, limit = 40): Promise
         { left: 'Value.Traded', operation: 'greater', right: 10000000 },
       ],
       columns: cols,
-      sort: { sortBy: 'Value.Traded', sortOrder: 'desc' },
-      range: [0, 250],
+      sort: { sortBy: 'Perf.3M', sortOrder: 'desc' },
+      range: [0, 450],
     };
     const resp = await postTvScan('america', payload);
     candidates = parseTvRows(resp?.data || [], cols, true).filter(pass52wFilter);
@@ -284,6 +286,7 @@ export async function runStage2Screener(market: MarketType, limit = 40): Promise
       'price_52_week_low',
       'average_volume_30d_calc',
       'Value.Traded',
+      'Perf.3M',
       'relative_volume_10d_calc',
     ];
     const basePayload = {
@@ -295,10 +298,11 @@ export async function runStage2Screener(market: MarketType, limit = 40): Promise
         { left: 'SMA50', operation: 'greater', right: 'SMA100' },
         { left: 'SMA100', operation: 'greater', right: 'SMA200' },
         { left: 'average_volume_30d_calc', operation: 'greater', right: 200000 },
+        { left: 'Value.Traded', operation: 'greater', right: 5000000 },
       ],
       columns: cols,
-      sort: { sortBy: 'Value.Traded', sortOrder: 'desc' },
-      range: [0, 250],
+      sort: { sortBy: 'Perf.3M', sortOrder: 'desc' },
+      range: [0, 450],
     };
     const resp = await postTvScan('taiwan', basePayload);
     candidates = parseTvRows(resp?.data || [], cols, false).filter(pass52wFilter);
@@ -311,6 +315,7 @@ export async function runStage2Screener(market: MarketType, limit = 40): Promise
           { left: 'close', operation: 'greater', right: 'SMA50' },
           { left: 'SMA50', operation: 'greater', right: 'SMA200' },
           { left: 'average_volume_30d_calc', operation: 'greater', right: 200000 },
+          { left: 'Value.Traded', operation: 'greater', right: 5000000 },
         ],
       };
       const suppResp = await postTvScan('taiwan', suppPayload);
@@ -452,9 +457,9 @@ function formatYmdTaipei(daysAgo: number): string {
   return formatDateInTz(Math.floor(ms / 1000), 'Asia/Taipei').replace(/-/g, '');
 }
 
-async function fetchTwseT86Days(maxDays = 3): Promise<Array<[string, Record<string, any>]>> {
+async function fetchTwseT86Days(maxDays = 10): Promise<Array<[string, Record<string, any>]>> {
   const collected: Array<[string, Record<string, any>]> = [];
-  for (let offset = 0; offset < 10 && collected.length < maxDays; offset++) {
+  for (let offset = 0; offset < 25 && collected.length < maxDays; offset++) {
     const ymd = formatYmdTaipei(offset);
     try {
       const resp = await fetchJsonWithTimeout(
@@ -595,15 +600,182 @@ async function fetchTpexMargin(): Promise<Record<string, any>> {
   }
 }
 
-export async function loadTwChipsSnapshot(): Promise<Record<string, Record<string, any>>> {
+function normalizeTpexYmd(rawDate: string | null): string {
+  const s = String(rawDate || '').trim();
+  if (s.includes('/')) {
+    const parts = s.split('/');
+    if (parts.length === 3 && parts.every((p) => /^\d+$/.test(p))) {
+      let yr = Number(parts[0]);
+      if (yr < 1911) yr += 1911;
+      return `${String(yr).padStart(4, '0')}${parts[1].padStart(2, '0')}${parts[2].padStart(2, '0')}`;
+    }
+  }
+  const digits = s.replace(/\D/g, '');
+  if (digits.length === 7) {
+    return `${String(Number(digits.slice(0, 3)) + 1911).padStart(4, '0')}${digits.slice(3)}`;
+  }
+  if (digits.length === 8) return digits;
+  return formatYmdTaipei(0);
+}
+
+function parseTpexDailyTrade(resp: any): Record<string, any> {
+  if (!resp || typeof resp !== 'object') return {};
+  const tables = Array.isArray(resp.tables) ? resp.tables : [];
+  let fields: string[] = [];
+  let rows: any[] = [];
+  if (tables.length > 0 && tables[0] && typeof tables[0] === 'object') {
+    fields = (tables[0].fields || []).map((f: any) => String(f).replace(/\s+/g, ''));
+    rows = tables[0].data || [];
+  } else if (Array.isArray(resp.aaData)) {
+    rows = resp.aaData;
+  }
+  if (!Array.isArray(rows) || rows.length === 0) return {};
+
+  const findIdx = (mustInclude: string[], exclude: string[] = []): number | null => {
+    for (let i = 0; i < fields.length; i++) {
+      const col = fields[i];
+      if (mustInclude.every((m) => col.includes(m)) && !exclude.some((ex) => col.includes(ex))) {
+        return i;
+      }
+    }
+    return null;
+  };
+
+  let fIdx = findIdx(['外資及陸資', '買賣超'], ['不含', '自營商']);
+  if (fIdx === null) fIdx = findIdx(['外資及陸資(不含外資自營商)', '買賣超']);
+  const tIdx = findIdx(['投信', '買賣超']);
+  const dIdx = findIdx(['自營商', '買賣超'], ['外資', '自行', '避險']);
+  const totIdx = findIdx(['三大法人買賣超']);
+
+  const dayMap: Record<string, any> = {};
+  for (const row of rows) {
+    if (!Array.isArray(row) || row.length < 10) continue;
+    const code = String(row[0] || '').trim();
+    if (!code) continue;
+    const nameZh = String(row[1] || '').trim() || null;
+    let fShares: number;
+    let tShares: number;
+    let dShares: number;
+    let totShares: number;
+    if (fIdx !== null && tIdx !== null && totIdx !== null) {
+      fShares = parseIntOrZero(row[fIdx]);
+      tShares = parseIntOrZero(row[tIdx]);
+      totShares = parseIntOrZero(row[totIdx]);
+      dShares = dIdx !== null ? parseIntOrZero(row[dIdx]) : totShares - fShares - tShares;
+    } else {
+      fShares = row.length > 10 ? parseIntOrZero(row[10]) : 0;
+      tShares = row.length > 13 ? parseIntOrZero(row[13]) : 0;
+      totShares = parseIntOrZero(row[row.length - 1]);
+      dShares = totShares - fShares - tShares;
+    }
+    dayMap[code] = {
+      name_zh: nameZh,
+      foreign: Math.round(fShares / 1000),
+      trust: Math.round(tShares / 1000),
+      dealer: Math.round(dShares / 1000),
+      total: Math.round(totShares / 1000),
+    };
+  }
+  return dayMap;
+}
+
+async function fetchTpexInstDays(days = 10): Promise<Array<[string, Record<string, any>]>> {
+  const byYmd = new Map<string, Record<string, any>>();
+  const latest = await fetchTpexInst();
+  if (Object.keys(latest.inst).length > 0) {
+    const ymd = normalizeTpexYmd(latest.date);
+    const mergedDay: Record<string, any> = {};
+    for (const [code, vals] of Object.entries(latest.inst)) {
+      mergedDay[code] = { ...vals, name_zh: latest.names[code] || null };
+    }
+    byYmd.set(ymd, mergedDay);
+  }
+
+  for (let offset = 0; offset < 25 && byYmd.size < days; offset++) {
+    const ymd = formatYmdTaipei(offset);
+    if (byYmd.has(ymd)) continue;
+    const dateParam = `${ymd.slice(0, 4)}/${ymd.slice(4, 6)}/${ymd.slice(6, 8)}`;
+    try {
+      const url = `https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade?type=Daily&sect=EW&date=${dateParam}&id=&response=json`;
+      const resp = await fetchJsonWithTimeout(url, {}, 10000);
+      const parsed = parseTpexDailyTrade(resp);
+      if (Object.keys(parsed).length > 0) {
+        byYmd.set(ymd, parsed);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return Array.from(byYmd.entries())
+    .sort((a, b) => b[0].localeCompare(a[0]))
+    .slice(0, days);
+}
+
+function aggregateInstDays(
+  daysList: Array<[string, Record<string, any>]>,
+  code: string
+): {
+  inst1d: Record<string, number> | null;
+  inst5d: Record<string, number> | null;
+  inst10d: Record<string, number> | null;
+  streak: number;
+  daysAvail: number;
+} {
+  if (daysList.length === 0) {
+    return { inst1d: null, inst5d: null, inst10d: null, streak: 0, daysAvail: 0 };
+  }
+  const raw1d = daysList[0][1][code];
+  const inst1d = raw1d
+    ? {
+        foreign: Number(raw1d.foreign || 0),
+        trust: Number(raw1d.trust || 0),
+        dealer: Number(raw1d.dealer || 0),
+        total: Number(raw1d.total || 0),
+      }
+    : null;
+
+  const sumWindow = (sliceDays: Array<[string, Record<string, any>]>) => {
+    const agg = { foreign: 0, trust: 0, dealer: 0, total: 0 };
+    let hasAny = false;
+    for (const [, dmap] of sliceDays) {
+      const row = dmap[code];
+      if (row) {
+        hasAny = true;
+        agg.foreign += Number(row.foreign || 0);
+        agg.trust += Number(row.trust || 0);
+        agg.dealer += Number(row.dealer || 0);
+        agg.total += Number(row.total || 0);
+      }
+    }
+    return hasAny ? agg : null;
+  };
+
+  const inst5d = sumWindow(daysList.slice(0, 5));
+  const inst10d = sumWindow(daysList.slice(0, 10));
+
+  let streak = 0;
+  for (const [, dmap] of daysList) {
+    const row = dmap[code];
+    if (row && Number(row.trust || 0) > 0) {
+      streak += 1;
+    } else {
+      break;
+    }
+  }
+
+  return { inst1d, inst5d, inst10d, streak, daysAvail: daysList.length };
+}
+
+export async function loadTwChipsSnapshot(t86Days = 10): Promise<Record<string, Record<string, any>>> {
   if (twChipsCache && twChipsCache.expiresAt > Date.now()) {
     return twChipsCache.value;
   }
 
-  const [twseDays, twseRevRaw, tpexInstRes, tpexMargin, tpexRevRaw] = await Promise.all([
-    fetchTwseT86Days(5).catch(() => []),
+  const [twseDays, twseRevRaw, tpexDays, tpexMargin, tpexRevRaw] = await Promise.all([
+    fetchTwseT86Days(t86Days).catch(() => []),
     fetchJsonWithTimeout('https://openapi.twse.com.tw/v1/opendata/t187ap05_L', {}, 10000).catch(() => []),
-    fetchTpexInst(),
+    fetchTpexInstDays(t86Days).catch(() => []),
     fetchTpexMargin(),
     fetchJsonWithTimeout('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O', {}, 10000).catch(() => []),
   ]);
@@ -619,33 +791,7 @@ export async function loadTwChipsSnapshot(): Promise<Record<string, Record<strin
 
   for (const code of twseCodes) {
     const raw1d = twseLatestInst[code];
-    const inst1d = raw1d
-      ? { foreign: raw1d.foreign, trust: raw1d.trust, dealer: raw1d.dealer, total: raw1d.total }
-      : null;
-
-    let inst5d: Record<string, number> | null = null;
-    let streak = 0;
-    if (twseDays.length > 0) {
-      const agg = { foreign: 0, trust: 0, dealer: 0, total: 0 };
-      let hasAny = false;
-      let streakBroken = false;
-      for (const [, dmap] of twseDays) {
-        const row = dmap[code];
-        if (row) {
-          hasAny = true;
-          agg.foreign += row.foreign;
-          agg.trust += row.trust;
-          agg.dealer += row.dealer;
-          agg.total += row.total;
-          if (!streakBroken && row.trust > 0) streak += 1;
-          else streakBroken = true;
-        } else {
-          streakBroken = true;
-        }
-      }
-      if (hasAny) inst5d = agg;
-    }
-
+    const { inst1d, inst5d, inst10d, streak, daysAvail } = aggregateInstDays(twseDays, code);
     const revInfo = twseRev[code] || {};
     snapshot[code] = {
       source: 'TWSE',
@@ -656,30 +802,37 @@ export async function loadTwChipsSnapshot(): Promise<Record<string, Record<strin
       monthly_revenue: revInfo.monthly_revenue || null,
       institutional_1d_lots: inst1d,
       institutional_5d_lots: inst5d,
+      institutional_10d_lots: inst10d,
+      institutional_days_available: daysAvail,
       trust_buy_streak_days: streak,
       margin: twseMargin[code] || null,
     };
   }
 
+  const tpexLatestInst = tpexDays.length > 0 ? tpexDays[0][1] : {};
+  const tpexDate = tpexDays.length > 0 ? tpexDays[0][0] : null;
   const tpexCodes = new Set([
-    ...Object.keys(tpexInstRes.inst),
+    ...Object.keys(tpexLatestInst),
     ...Object.keys(tpexMargin),
     ...Object.keys(tpexRev),
   ]);
   for (const code of tpexCodes) {
     if (snapshot[code]) continue;
+    const raw1d = tpexLatestInst[code];
+    const { inst1d, inst5d, inst10d, streak, daysAvail } = aggregateInstDays(tpexDays, code);
     const revInfo = tpexRev[code] || {};
-    const inst1d = tpexInstRes.inst[code] || null;
     snapshot[code] = {
       source: 'TPEX',
       market_board: 'TPEX',
-      name_zh: revInfo.name_zh || tpexInstRes.names[code] || null,
-      data_date: tpexInstRes.date,
+      name_zh: revInfo.name_zh || raw1d?.name_zh || null,
+      data_date: tpexDate,
       industry: revInfo.industry || null,
       monthly_revenue: revInfo.monthly_revenue || null,
       institutional_1d_lots: inst1d,
-      institutional_5d_lots: null,
-      trust_buy_streak_days: inst1d && inst1d.trust > 0 ? 1 : 0,
+      institutional_5d_lots: inst5d,
+      institutional_10d_lots: inst10d,
+      institutional_days_available: daysAvail,
+      trust_buy_streak_days: streak,
       margin: tpexMargin[code] || null,
     };
   }

@@ -19,13 +19,17 @@ import {
 } from './server/telegram.ts';
 import type { FocusListItem, MarketType, PostMarketScanReport } from './server/types.ts';
 import {
+  assignRsRatings,
   calculateVcpMetrics,
+  classifyVcpTier,
   EARNINGS_DOWNGRADE,
   evaluateBreakout,
   GRADE_PRIORITY,
   MARKET_CONFIGS,
   parseCsvOhlcv,
   scoreCandidate,
+  STATUS_PRIORITY,
+  TIER_PRIORITY,
 } from './server/vcpEngine.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -223,8 +227,8 @@ async function createApp() {
 
   app.post('/api/scan', async (req, res) => {
     const market = parseMarket(req.body?.market);
-    const maxCandidates = Math.min(60, Math.max(10, Number(req.body?.maxCandidates || 30)));
-    const focusMin = Math.min(15, Math.max(3, Number(req.body?.focusMin || 5)));
+    const maxCandidates = Math.min(150, Math.max(10, Number(req.body?.maxCandidates || 150)));
+    const focusMin = Math.min(15, Math.max(0, Number(req.body?.focusMin ?? 0)));
     const focusMax = Math.min(20, Math.max(focusMin, Number(req.body?.focusMax || 15)));
 
     const cfg = MARKET_CONFIGS[market];
@@ -271,6 +275,8 @@ async function createApp() {
       let vcpTightCount = 0;
       let earningsWarningCount = 0;
 
+      assignRsRatings(evaluated);
+
       const scoredItems: Omit<FocusListItem, 'rank'>[] = evaluated.map(({ row, result, volMa50 }) => {
         const g1 = result.gate1_market;
         const g2 = result.gate2_trend_rs;
@@ -279,7 +285,10 @@ async function createApp() {
         const meta = result.meta;
 
         if (g2.stage2_template_pass) stage2Count += 1;
-        if (g4.bbw_120d_percentile <= 25.0 && g4.atr_5_20_ratio <= 0.75 && g4.tightness_10d_pct <= 10.0) {
+        if (
+          (g4.bbw_120d_percentile <= 25.0 && g4.atr_5_20_ratio <= 0.75 && g4.tightness_10d_pct <= 10.0) ||
+          (g4.range_contracting && g4.range_5d_tight)
+        ) {
           vcpTightCount += 1;
         }
 
@@ -287,8 +296,9 @@ async function createApp() {
         const preGrade = meta.pre_filter_grade;
         let focusGrade: string = preGrade;
         const warnings: string[] = [];
+        const hasEarningsWarn = Boolean(g3.earnings_warning);
 
-        if (g3.earnings_warning) {
+        if (hasEarningsWarn) {
           earningsWarningCount += 1;
           warnings.push('EARNINGS_WARNING');
           focusGrade = EARNINGS_DOWNGRADE[preGrade] || preGrade;
@@ -298,12 +308,18 @@ async function createApp() {
           warnings.push('MARKET_DOWNTREND');
         }
 
+        const vcpTier = classifyVcpTier(result, market, evaluated.length, hasEarningsWarn);
+        const setupStatus = String(g4.setup_status || meta.setup_status || 'CONSOLIDATING');
+
         return {
           symbol: row.symbol,
           name: row.name || row.symbol,
           name_zh: market === 'TW' ? String(g3.name_zh || '') : '',
           exchange: row.exchange || '',
           sector: row.sector ?? null,
+          vcp_tier: vcpTier,
+          setup_status: setupStatus,
+          rs_rating: g2.rs_rating ?? null,
           focus_grade: focusGrade,
           pre_filter_grade: preGrade,
           vcp_score: score,
@@ -311,13 +327,23 @@ async function createApp() {
           close_price: meta.close_price,
           suggested_pivot: g4.suggested_pivot,
           suggested_stop_loss: g4.suggested_stop_loss,
+          tight_stop_5d_low: g4.tight_stop_5d_low,
           stop_loss_pct: g4.stop_loss_pct,
+          dist_to_pivot_pct: g4.dist_to_pivot_pct,
+          target_2r: g4.target_2r,
+          target_3r: g4.target_3r,
           vol_ma50: volMa50,
           metrics: result,
         };
       });
 
       const sortDesc = (a: Omit<FocusListItem, 'rank'>, b: Omit<FocusListItem, 'rank'>) => {
+        const ta = TIER_PRIORITY[a.vcp_tier || 'B'] ?? 0;
+        const tb = TIER_PRIORITY[b.vcp_tier || 'B'] ?? 0;
+        if (tb !== ta) return tb - ta;
+        const sa = STATUS_PRIORITY[a.setup_status || ''] ?? 0;
+        const sb = STATUS_PRIORITY[b.setup_status || ''] ?? 0;
+        if (sb !== sa) return sb - sa;
         const ga = GRADE_PRIORITY[a.focus_grade] ?? 0;
         const gb = GRADE_PRIORITY[b.focus_grade] ?? 0;
         if (gb !== ga) return gb - ga;
@@ -415,6 +441,7 @@ async function createApp() {
       const telegramPreview = formatIntradayBreakoutAlert({
         symbol,
         market,
+        exchange: String(req.body?.exchange || ''),
         name_zh: nameZh,
         last_price: evaluation.last_price,
         suggested_pivot: evaluation.suggested_pivot,

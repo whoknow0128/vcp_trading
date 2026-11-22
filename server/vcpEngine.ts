@@ -36,6 +36,21 @@ export const MARKET_CONFIGS: Record<MarketType, MarketConfig> = {
   },
 };
 
+export const TIER_PRIORITY: Record<string, number> = {
+  S: 3,
+  A: 2,
+  B: 1,
+  C: 0,
+};
+
+export const STATUS_PRIORITY: Record<string, number> = {
+  BREAKOUT: 3,
+  PIVOT_READY: 2,
+  CONSOLIDATING: 1,
+  EXTENDED: 0,
+  NONE: 0,
+};
+
 export const GRADE_PRIORITY: Record<string, number> = {
   A_CANDIDATE: 4,
   B_WATCHLIST: 3,
@@ -54,6 +69,18 @@ export const EARNINGS_DOWNGRADE: Record<string, string> = {
 function round(val: number, digits = 2): number {
   const factor = Math.pow(10, digits);
   return Math.round((val + Number.EPSILON) * factor) / factor;
+}
+
+function windowRangePct(bars: OhlcvBar[]): number {
+  if (bars.length === 0) return 0.0;
+  let hi = -Infinity;
+  let lo = Infinity;
+  for (const b of bars) {
+    if (b.high > hi) hi = b.high;
+    if (b.low < lo) lo = b.low;
+  }
+  if (hi <= 0 || !Number.isFinite(hi) || !Number.isFinite(lo)) return 0.0;
+  return round(((hi - lo) / hi) * 100.0, 2);
 }
 
 export function normalizeOhlcv(bars: OhlcvBar[]): OhlcvBar[] {
@@ -254,6 +281,7 @@ export function calculateVcpMetrics(
 
   let rsLine52wHigh = false;
   let rsAboveMa50 = false;
+  let rsRawScore = 0.0;
   const rsByDate = new Map<string, { rs: number; rsMa50: number | null }>();
 
   if (mergedRs.length >= 60) {
@@ -268,9 +296,28 @@ export function calculateVcpMetrics(
     rsLine52wHigh = rsCurrent >= rs52wMax * 0.995;
     const lastRsMa50 = rsMa50Arr[rsMa50Arr.length - 1];
     rsAboveMa50 = lastRsMa50 !== null && rsCurrent > lastRsMa50;
+
+    const rsWindows: Array<[number, number]> = [
+      [63, 0.4],
+      [126, 0.2],
+      [189, 0.2],
+      [252, 0.2],
+    ];
+    let weightedSum = 0.0;
+    let weightTotal = 0.0;
+    for (const [lookback, weight] of rsWindows) {
+      if (mergedRs.length > lookback) {
+        const baseRs = mergedRs[mergedRs.length - (lookback + 1)];
+        if (baseRs > 0) {
+          weightedSum += (rsCurrent / baseRs - 1.0) * 100.0 * weight;
+          weightTotal += weight;
+        }
+      }
+    }
+    rsRawScore = weightTotal > 0 ? round(weightedSum / weightTotal, 2) : 0.0;
   }
 
-  // Gate 4: Bollinger Bands & BBW 120d percentile
+  // Gate 4: Bollinger Bands & BBW 120d percentile (as of T-1)
   const bbStd = rollingStdPop(closes, 20);
   const bbUpper: (number | null)[] = new Array(df.length).fill(null);
   const bbLower: (number | null)[] = new Array(df.length).fill(null);
@@ -287,64 +334,134 @@ export function calculateVcpMetrics(
     }
   }
 
-  const bbwCurrent = (bbwSeries[lastIdx] ?? 0) as number;
-  const bbw120 = bbwSeries.slice(-120).filter((v): v is number => v !== null);
+  const bbwT1Series = bbwSeries.slice(0, -1);
+  const bbwCurrent = (bbwT1Series[bbwT1Series.length - 1] ?? 0) as number;
+  const bbw120 = bbwT1Series.slice(-120).filter((v): v is number => v !== null);
   const bbw120dPercentile =
     bbw120.length > 0 ? (bbw120.filter((v) => v <= bbwCurrent).length / bbw120.length) * 100.0 : 50.0;
   const priceAboveBbMid = closePrice >= (ma20[lastIdx] as number);
 
-  // ADR% (20d) & ATR(5)/ATR(20)
+  // ADR% (20d) & ATR(5)/ATR(20) (as of T-1) & ATR14% 60d percentile
   const dailyRangePct = df.map((b) => (b.low > 0 ? (b.high - b.low) / b.low : 0));
   const adrSeries = rollingMean(dailyRangePct, 20);
   const adr20dPct = ((adrSeries[lastIdx] ?? 0) as number) * 100.0;
 
   const atr5Series = calcAtr(df, 5);
   const atr20Series = calcAtr(df, 20);
-  const atr5 = (atr5Series[lastIdx] ?? 0) as number;
+  const atr5T1 = (atr5Series[lastIdx - 1] ?? 0) as number;
+  const atr20T1 = (atr20Series[lastIdx - 1] ?? 0) as number;
+  const atr520Ratio = atr20T1 > 0 ? round(atr5T1 / atr20T1, 3) : 1.0;
   const atr20 = (atr20Series[lastIdx] ?? 0) as number;
-  const atr520Ratio = atr20 > 0 ? round(atr5 / atr20, 3) : 1.0;
+
+  const atr14Series = calcAtr(df, 14);
+  const atr14PctSeries = atr14Series
+    .slice(0, -1)
+    .map((a, idx) => (a !== null && df[idx].close > 0 ? (a / df[idx].close) * 100.0 : null))
+    .filter((v): v is number => v !== null);
+  let atr14PctCurrent = 0.0;
+  let atr14Pct60dPercentile = 50.0;
+  if (atr14PctSeries.length > 0) {
+    const curAtr14Pct = atr14PctSeries[atr14PctSeries.length - 1];
+    atr14PctCurrent = round(curAtr14Pct, 2);
+    const atr14_60d = atr14PctSeries.slice(-60);
+    atr14Pct60dPercentile = round(
+      (atr14_60d.filter((v) => v <= curAtr14Pct).length / atr14_60d.length) * 100.0,
+      2
+    );
+  }
+  const atr14Low60d = atr14Pct60dPercentile <= 25.0;
 
   const latestMa10 = ma10[lastIdx] as number;
   const distFrom10maInAtr = atr20 > 0 ? round((closePrice - latestMa10) / atr20, 2) : 0.0;
 
-  // Volume-Price Action (VDU, Pocket Pivot, Distribution Days)
+  // Volume-Price Action (VDU 3D & 5D T-1, Pocket Pivot, Distribution Days)
   const volMa50 = (volMa50Series[lastIdx] ?? 0) as number;
   const volRatio50d = volMa50 > 0 ? round(latest.volume / volMa50, 2) : 1.0;
   const recent3dVolAvg =
     (df[lastIdx].volume + df[lastIdx - 1].volume + df[lastIdx - 2].volume) / 3.0;
   const isVdu3d = volMa50 > 0 && recent3dVolAvg < volMa50 * 0.7;
 
+  const volSlice5T1 = df.slice(-6, -1);
+  const volMa5T1 =
+    volSlice5T1.length > 0 ? volSlice5T1.reduce((acc, b) => acc + b.volume, 0) / volSlice5T1.length : 0;
+  const volSlice50T1 = df.length >= 51 ? df.slice(-51, -1) : null;
+  const volMa50T1 =
+    volSlice50T1 && volSlice50T1.length > 0
+      ? volSlice50T1.reduce((acc, b) => acc + b.volume, 0) / volSlice50T1.length
+      : volMa50;
+  const volMa5To50Ratio = volMa50T1 > 0 ? round(volMa5T1 / volMa50T1, 3) : 1.0;
+  const isVdu5d = volMa50T1 > 0 && volMa5T1 < volMa50T1 * 0.6;
+
   const pocketPivotIn5d = detectPocketPivot(df, 5);
   const distDays10d = countDistributionDays(df, 10);
 
-  // Right-side 10D tightness, Pivot & Stop-Loss
-  const recent10 = df.slice(-10);
-  let recent10dHigh = -Infinity;
-  let recent10dLow = Infinity;
-  for (const b of recent10) {
-    if (b.high > recent10dHigh) recent10dHigh = b.high;
-    if (b.low < recent10dLow) recent10dLow = b.low;
+  // Right-side consolidation (as of T-1), Pivot, Stop-Loss & R:R
+  const t1Df = df.slice(0, -1);
+  const range40dPct = windowRangePct(t1Df.slice(-40));
+  const range20dPct = windowRangePct(t1Df.slice(-20));
+  const prior10dDf = t1Df.slice(-10);
+  let prior10dHigh = -Infinity;
+  let prior10dLow = Infinity;
+  for (const b of prior10dDf) {
+    if (b.high > prior10dHigh) prior10dHigh = b.high;
+    if (b.low < prior10dLow) prior10dLow = b.low;
   }
-  const tightness10dPct = round(((recent10dHigh - recent10dLow) / recent10dHigh) * 100.0, 2);
+  const tightness10dPct = windowRangePct(prior10dDf);
+  const range10dPct = tightness10dPct;
+  const range5dPct = windowRangePct(t1Df.slice(-5));
+  const rangeContracting = range5dPct < range10dPct && range10dPct < range20dPct;
+  const contractionSteps =
+    (range5dPct < range10dPct ? 1 : 0) +
+    (range10dPct < range20dPct ? 1 : 0) +
+    (range20dPct < range40dPct ? 1 : 0);
+  const range5dTight = range5dPct <= 8.0;
 
-  const suggestedPivot = round(recent10dHigh * 1.002, 2);
+  const suggestedPivot = round(prior10dHigh * 1.002, 2);
   const hardStopFloor = suggestedPivot * 0.92;
-  const suggestedStopLoss = round(Math.max(recent10dLow * 0.995, hardStopFloor), 2);
+  const suggestedStopLoss = round(Math.max(prior10dLow * 0.995, hardStopFloor), 2);
+  const prior5dLow = Math.min(...t1Df.slice(-5).map((b) => b.low));
+  const tightStop5dLow = round(Math.max(prior5dLow * 0.995, hardStopFloor), 2);
   const stopLossPct = round((suggestedStopLoss / suggestedPivot - 1.0) * 100.0, 2);
   const stopLossInAtr = atr20 > 0 ? round((suggestedPivot - suggestedStopLoss) / atr20, 2) : 0.0;
+  const distToPivotPct = prior10dHigh > 0 ? round((closePrice / prior10dHigh - 1.0) * 100.0, 2) : 0.0;
+  const riskPerShare = Math.max(0.01, suggestedPivot - suggestedStopLoss);
+  const target2r = round(suggestedPivot + 2.0 * riskPerShare, 2);
+  const target3r = round(suggestedPivot + 3.0 * riskPerShare, 2);
 
-  // Pre-filter Grade
+  // Setup status & Pre-filter Grade
+  const dayHigh = latest.high;
+  const dayLow = latest.low;
+  const closingRange =
+    dayHigh > dayLow
+      ? round((closePrice - dayLow) / (dayHigh - dayLow), 4)
+      : closePrice >= df[lastIdx - 1].close
+        ? 1.0
+        : 0.0;
+
+  const isBreakoutBar = closePrice > prior10dHigh && volRatio50d >= 1.5 && closingRange >= 0.65;
+  let setupStatus: 'BREAKOUT' | 'PIVOT_READY' | 'CONSOLIDATING' | 'EXTENDED' | 'NONE';
+  if (!stage2Pass || distDays10d >= 3) {
+    setupStatus = 'NONE';
+  } else if (distFrom10maInAtr > 3.5) {
+    setupStatus = 'EXTENDED';
+  } else if (isBreakoutBar) {
+    setupStatus = 'BREAKOUT';
+  } else if (distToPivotPct >= -4.0 && distToPivotPct <= 0.0) {
+    setupStatus = 'PIVOT_READY';
+  } else {
+    setupStatus = 'CONSOLIDATING';
+  }
+
+  const vcpTightPass =
+    ((bbw120dPercentile <= 25.0 && atr520Ratio <= 0.75 && tightness10dPct <= 10.0) ||
+      (rangeContracting && range5dTight && (atr14Low60d || atr520Ratio <= 0.75))) &&
+    (isVdu3d || isVdu5d || pocketPivotIn5d);
+
   let preGrade: 'A_CANDIDATE' | 'B_WATCHLIST' | 'B_OR_C_REVIEW' | 'C';
   if (!stage2Pass || distDays10d >= 3 || distFrom10maInAtr > 3.5) {
     preGrade = 'C';
-  } else if (
-    bbw120dPercentile <= 25.0 &&
-    atr520Ratio <= 0.75 &&
-    tightness10dPct <= 10.0 &&
-    (isVdu3d || pocketPivotIn5d)
-  ) {
-    const isBreakoutToday = closePrice >= recent10dHigh * 0.995 && volRatio50d >= 1.4;
-    preGrade = isBreakoutToday ? 'A_CANDIDATE' : 'B_WATCHLIST';
+  } else if (vcpTightPass) {
+    preGrade = isBreakoutBar ? 'A_CANDIDATE' : 'B_WATCHLIST';
   } else {
     preGrade = 'B_OR_C_REVIEW';
   }
@@ -358,6 +475,7 @@ export function calculateVcpMetrics(
       benchmark_symbol: cfg.benchmarkSymbol,
       ma_mode: cfg.maModeLabel,
       pre_filter_grade: preGrade,
+      setup_status: setupStatus,
     },
     gate1_market: {
       benchmark_above_50ma: bmAbove50,
@@ -377,6 +495,7 @@ export function calculateVcpMetrics(
       pct_from_52w_low: round(pctFrom52wLow, 2),
       rs_line_52w_high: rsLine52wHigh,
       rs_above_ma50: rsAboveMa50,
+      rs_raw_score: rsRawScore,
     },
     gate3_catalysts: catalysts || { status: 'NOT_PROVIDED_REQUIRE_MANUAL_OR_ADAPTER' },
     gate4_setup_risk: {
@@ -385,18 +504,39 @@ export function calculateVcpMetrics(
       price_above_bb_mid: priceAboveBbMid,
       adr_20d_pct: round(adr20dPct, 2),
       atr_5_20_ratio: atr520Ratio,
+      atr14_pct_current: atr14PctCurrent,
+      atr14_pct_60d_percentile: atr14Pct60dPercentile,
+      atr14_low_60d: atr14Low60d,
       tightness_10d_pct: tightness10dPct,
+      range_40d_pct: range40dPct,
+      range_20d_pct: range20dPct,
+      range_10d_pct: range10dPct,
+      range_5d_pct: range5dPct,
+      range_contracting: rangeContracting,
+      contraction_steps: contractionSteps,
+      range_5d_tight: range5dTight,
       vol_ratio_50d: volRatio50d,
+      vol_ma5_to_50_ratio: volMa5To50Ratio,
+      closing_range: round(closingRange, 3),
       is_vdu_3d: isVdu3d,
+      is_vdu_5d: isVdu5d,
       pocket_pivot_in_5d: pocketPivotIn5d,
       distribution_days_10d: distDays10d,
       dist_from_10ma_in_atr: distFrom10maInAtr,
-      recent_10d_high: round(recent10dHigh, 2),
-      recent_10d_low: round(recent10dLow, 2),
+      prior_10d_high: round(prior10dHigh, 2),
+      prior_10d_low: round(prior10dLow, 2),
+      prior_5d_low: round(prior5dLow, 2),
+      recent_10d_high: round(prior10dHigh, 2),
+      recent_10d_low: round(prior10dLow, 2),
       suggested_pivot: suggestedPivot,
       suggested_stop_loss: suggestedStopLoss,
+      tight_stop_5d_low: tightStop5dLow,
       stop_loss_pct: stopLossPct,
       stop_loss_in_atr: stopLossInAtr,
+      dist_to_pivot_pct: distToPivotPct,
+      setup_status: setupStatus,
+      target_2r: target2r,
+      target_3r: target3r,
     },
   };
 
@@ -430,6 +570,83 @@ export function calculateVcpMetrics(
   return { metrics, chart, volMa50: Math.round(volMa50) };
 }
 
+export function assignRsRatings(evaluated: Array<{ result: VcpMetricsResult }>): void {
+  const n = evaluated.length;
+  if (n === 0) return;
+  if (n === 1) {
+    evaluated[0].result.gate2_trend_rs.rs_rating = 99;
+    return;
+  }
+  const ranked = [...evaluated].sort(
+    (a, b) => Number(a.result.gate2_trend_rs.rs_raw_score ?? 0) - Number(b.result.gate2_trend_rs.rs_raw_score ?? 0)
+  );
+  ranked.forEach((item, idx) => {
+    const rating = Math.max(1, Math.min(99, Math.round(1 + (idx / (n - 1)) * 98)));
+    item.result.gate2_trend_rs.rs_rating = rating;
+  });
+}
+
+function hasCatalystResonance(g3: Record<string, any>, market: MarketType): boolean {
+  if (market === 'TW') {
+    const inst = g3.institutional_10d_lots || g3.institutional_5d_lots || g3.institutional_1d_lots || {};
+    if ((inst.trust || 0) > 0 || (inst.foreign || 0) > 0) return true;
+    const revYoy = g3.monthly_revenue?.yoy_pct;
+    return revYoy !== null && revYoy !== undefined && Number(revYoy) > 15.0;
+  }
+  const epsYoy = g3.eps_yoy_fq_pct;
+  const revYoy = g3.revenue_yoy_fq_pct;
+  return (
+    (epsYoy !== null && epsYoy !== undefined && Number(epsYoy) > 15.0) ||
+    (revYoy !== null && revYoy !== undefined && Number(revYoy) > 15.0)
+  );
+}
+
+export function classifyVcpTier(
+  res: VcpMetricsResult,
+  market: MarketType,
+  evaluatedCount: number,
+  hasEarningsWarn: boolean
+): 'S' | 'A' | 'B' | 'C' {
+  const g2 = res.gate2_trend_rs;
+  const g3 = res.gate3_catalysts || {};
+  const g4 = res.gate4_setup_risk;
+
+  if (
+    !g2.stage2_template_pass ||
+    Number(g4.distribution_days_10d ?? 0) >= 3 ||
+    Number(g4.dist_from_10ma_in_atr ?? 0) > 3.5
+  ) {
+    return 'C';
+  }
+
+  const status = String(g4.setup_status || 'CONSOLIDATING');
+  const steps = Number(g4.contraction_steps ?? 0);
+  const tightVcp =
+    Boolean(g4.range_contracting && g4.range_5d_tight) ||
+    (Number(g4.bbw_120d_percentile ?? 100) <= 25.0 &&
+      Number(g4.atr_5_20_ratio ?? 1.0) <= 0.75 &&
+      Number(g4.tightness_10d_pct ?? 100) <= 10.0);
+  const hasVdu = Boolean(g4.is_vdu_5d || g4.is_vdu_3d || g4.pocket_pivot_in_5d);
+  const rsRating = g2.rs_rating;
+  const rsOk = evaluatedCount < 4 || rsRating == null ? true : Number(rsRating) >= 75;
+  const resonance = hasCatalystResonance(g3, market);
+
+  if (
+    !hasEarningsWarn &&
+    rsOk &&
+    (steps >= 2 || tightVcp) &&
+    hasVdu &&
+    resonance &&
+    (status === 'BREAKOUT' || status === 'PIVOT_READY')
+  ) {
+    return 'S';
+  }
+  if (!hasEarningsWarn && (tightVcp || status === 'BREAKOUT' || status === 'PIVOT_READY') && (hasVdu || resonance)) {
+    return 'A';
+  }
+  return 'B';
+}
+
 export function scoreCandidate(result: VcpMetricsResult, market: MarketType): number {
   const g2 = result.gate2_trend_rs;
   const g3 = result.gate3_catalysts || {};
@@ -437,30 +654,53 @@ export function scoreCandidate(result: VcpMetricsResult, market: MarketType): nu
 
   let score = 0;
   if (g2.stage2_template_pass) score += 30;
-  if (g2.rs_line_52w_high) score += 15;
-  if (g2.rs_above_ma50) score += 8;
+  if (g2.rs_line_52w_high) score += 12;
+  if (g2.rs_above_ma50) score += 6;
+
+  if (g2.rs_rating != null) {
+    if (Number(g2.rs_rating) >= 75) score += 10;
+    else if (Number(g2.rs_rating) < 50) score -= 10;
+  }
 
   const bbwPct = Number(g4.bbw_120d_percentile ?? 100);
-  if (bbwPct <= 25.0) score += 15;
-  else if (bbwPct <= 40.0) score += 6;
+  if (bbwPct <= 25.0) score += 12;
+  else if (bbwPct <= 40.0) score += 5;
 
   const atrRatio = Number(g4.atr_5_20_ratio ?? 1.0);
-  if (atrRatio <= 0.75) score += 12;
-  else if (atrRatio <= 0.9) score += 5;
+  if (atrRatio <= 0.75) score += 10;
+  else if (atrRatio <= 0.9) score += 4;
+
+  if (g4.atr14_low_60d) score += 5;
 
   const tight = Number(g4.tightness_10d_pct ?? 100);
-  if (tight <= 10.0) score += 8;
-  else if (tight <= 15.0) score += 3;
+  if (tight <= 10.0) score += 6;
+  else if (tight <= 15.0) score += 2;
 
-  if (g4.is_vdu_3d || g4.pocket_pivot_in_5d) score += 8;
+  if (g4.range_contracting) score += 8;
+  if (g4.range_5d_tight) score += 5;
+
+  if (g4.is_vdu_5d) score += 6;
+  else if (g4.is_vdu_3d || g4.pocket_pivot_in_5d) score += 4;
+
   if (g4.price_above_bb_mid) score += 4;
+
+  const status = String(g4.setup_status || '');
+  if (status === 'BREAKOUT') score += 12;
+  else if (status === 'PIVOT_READY') score += 10;
 
   if (Number(g4.distribution_days_10d ?? 0) >= 3) score -= 15;
   if (Number(g4.dist_from_10ma_in_atr ?? 0) > 3.5) score -= 10;
 
+  const adrPct = Number(g4.adr_20d_pct ?? 5.0);
+  if (adrPct < 2.0) score -= 15;
+  else if (adrPct > 10.0) score -= 10;
+
   if (market === 'TW') {
-    const inst = g3.institutional_5d_lots || g3.institutional_1d_lots || {};
-    if ((inst.trust || 0) > 0 || (inst.foreign || 0) > 0) score += 4;
+    const inst = g3.institutional_10d_lots || g3.institutional_5d_lots || g3.institutional_1d_lots || {};
+    const trustNet = Number(inst.trust || 0);
+    const foreignNet = Number(inst.foreign || 0);
+    if (trustNet > 0 && foreignNet > 0) score += 6;
+    else if (trustNet > 0 || foreignNet > 0) score += 4;
     const revYoy = g3.monthly_revenue?.yoy_pct;
     if (revYoy !== null && revYoy !== undefined && Number(revYoy) > 15.0) score += 4;
   } else {
