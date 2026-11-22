@@ -1,0 +1,5 @@
+{
+  "name": "SEPA × VCP Trading Workbench",
+  "description": "Cross-market (US & TW) Mark Minervini SEPA / VCP stock screener, 4-gate quantitative diagnostic engine, and intraday pivot breakout risk calculator.",
+  "requestFramePermissions": []
+}

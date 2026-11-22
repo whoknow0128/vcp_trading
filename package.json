@@ -1,0 +1,38 @@
+{
+  "name": "vcp-trading-workbench",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build": "vite build",
+    "start": "NODE_ENV=production node server.ts",
+    "lint": "tsc --noEmit && eslint src server server.ts"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "js-yaml": "^4.1.0",
+    "lucide-react": "^0.475.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^2.15.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.20.0",
+    "@tailwindcss/vite": "^4.0.6",
+    "@types/express": "^5.0.0",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.13.4",
+    "@types/react": "^19.0.8",
+    "@types/react-dom": "^19.0.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^9.20.0",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "globals": "^15.15.0",
+    "tailwindcss": "^4.0.6",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.24.0",
+    "vite": "^6.1.0"
+  }
+}
