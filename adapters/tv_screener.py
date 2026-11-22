@@ -199,6 +199,7 @@ def _parse_tv_rows(rows: List[Dict[str, Any]], cols: List[str], is_us: bool) -> 
                 "price_52w_low": m.get("price_52_week_low"),
                 "avg_vol_30d": m.get("average_volume_30d_calc"),
                 "value_traded": m.get("Value.Traded"),
+                "perf_3m": m.get("Perf.3M"),
                 "rel_vol_10d": m.get("relative_volume_10d_calc"),
                 "next_earnings_date": next_earnings_date,
                 "eps_yoy_fq": m.get("earnings_per_share_diluted_yoy_growth_fq") if is_us else None,
@@ -217,7 +218,7 @@ def _pass_52w_filter(item: Dict[str, Any]) -> bool:
     return (c >= h52 * 0.75) and (c >= l52 * 1.30)
 
 
-def run_stage2_screener(market: str, limit: int = 60) -> List[Dict[str, Any]]:
+def run_stage2_screener(market: str, limit: int = 150) -> List[Dict[str, Any]]:
     """執行 TradingView Scanner Stage 2 初篩，將數千檔壓縮為候選清單。"""
     market = market.upper()
     if market not in ("US", "TW"):
@@ -242,6 +243,7 @@ def run_stage2_screener(market: str, limit: int = 60) -> List[Dict[str, Any]]:
                 "price_52_week_low",
                 "average_volume_30d_calc",
                 "Value.Traded",
+                "Perf.3M",
                 "relative_volume_10d_calc",
                 "earnings_release_next_date",
                 "earnings_per_share_diluted_yoy_growth_fq",
@@ -260,8 +262,8 @@ def run_stage2_screener(market: str, limit: int = 60) -> List[Dict[str, Any]]:
                     {"left": "Value.Traded", "operation": "greater", "right": 10000000},
                 ],
                 "columns": cols,
-                "sort": {"sortBy": "Value.Traded", "sortOrder": "desc"},
-                "range": [0, 300],
+                "sort": {"sortBy": "Perf.3M", "sortOrder": "desc"},
+                "range": [0, 450],
             }
             resp = _post_tv_scan(scanner_market, payload)
             candidates = [r for r in _parse_tv_rows(resp.get("data") or [], cols, is_us=True) if _pass_52w_filter(r)]
@@ -280,6 +282,7 @@ def run_stage2_screener(market: str, limit: int = 60) -> List[Dict[str, Any]]:
                 "price_52_week_low",
                 "average_volume_30d_calc",
                 "Value.Traded",
+                "Perf.3M",
                 "relative_volume_10d_calc",
             ]
             base_payload = {
@@ -291,10 +294,11 @@ def run_stage2_screener(market: str, limit: int = 60) -> List[Dict[str, Any]]:
                     {"left": "SMA50", "operation": "greater", "right": "SMA100"},
                     {"left": "SMA100", "operation": "greater", "right": "SMA200"},
                     {"left": "average_volume_30d_calc", "operation": "greater", "right": 200000},
+                    {"left": "Value.Traded", "operation": "greater", "right": 5000000},
                 ],
                 "columns": cols,
-                "sort": {"sortBy": "Value.Traded", "sortOrder": "desc"},
-                "range": [0, 300],
+                "sort": {"sortBy": "Perf.3M", "sortOrder": "desc"},
+                "range": [0, 450],
             }
             resp = _post_tv_scan(scanner_market, base_payload)
             candidates = [r for r in _parse_tv_rows(resp.get("data") or [], cols, is_us=False) if _pass_52w_filter(r)]
@@ -306,6 +310,7 @@ def run_stage2_screener(market: str, limit: int = 60) -> List[Dict[str, Any]]:
                     {"left": "close", "operation": "greater", "right": "SMA50"},
                     {"left": "SMA50", "operation": "greater", "right": "SMA200"},
                     {"left": "average_volume_30d_calc", "operation": "greater", "right": 200000},
+                    {"left": "Value.Traded", "operation": "greater", "right": 5000000},
                 ]
                 supp_resp = _post_tv_scan(scanner_market, supp_payload)
                 seen = {c["symbol"] for c in candidates}

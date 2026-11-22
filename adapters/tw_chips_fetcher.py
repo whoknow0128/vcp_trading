@@ -72,12 +72,12 @@ def _get_no_space(row: Dict[str, Any], target_no_space: str) -> Any:
     return None
 
 
-def _fetch_twse_t86_days(t86_days: int = 5) -> List[Tuple[str, Dict[str, Dict[str, int]]]]:
+def _fetch_twse_t86_days(t86_days: int = 10) -> List[Tuple[str, Dict[str, Dict[str, Any]]]]:
     today = _tw_today()
     today_str = today.strftime("%Y%m%d")
-    collected: List[Tuple[str, Dict[str, Dict[str, int]]]] = []
+    collected: List[Tuple[str, Dict[str, Dict[str, Any]]]] = []
 
-    for offset in range(14):
+    for offset in range(25):
         if len(collected) >= t86_days:
             break
         ymd = (today - timedelta(days=offset)).strftime("%Y%m%d")
@@ -258,14 +258,189 @@ def _parse_revenue_rows(rows: Any) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def load_tw_chips_snapshot(max_cache_hours: float = 12.0, t86_days: int = 5) -> Dict[str, Dict[str, Any]]:
-    """載入台股全市場（上市＋上櫃）籌碼與月營收快照。"""
+def _normalize_tpex_ymd(raw_date: Optional[str]) -> str:
+    s = str(raw_date or "").strip()
+    if "/" in s:
+        parts = s.split("/")
+        if len(parts) == 3 and all(p.isdigit() for p in parts):
+            yr = int(parts[0])
+            if yr < 1911:
+                yr += 1911
+            return f"{yr:04d}{int(parts[1]):02d}{int(parts[2]):02d}"
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) == 7:
+        return f"{int(digits[:3]) + 1911:04d}{digits[3:]}"
+    if len(digits) == 8:
+        return digits
+    return _tw_today().strftime("%Y%m%d")
+
+
+def _parse_tpex_daily_trade(resp: Any) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(resp, dict):
+        return {}
+    tables = resp.get("tables") or []
+    fields: List[str] = []
+    rows: List[List[Any]] = []
+    if tables and isinstance(tables[0], dict):
+        fields = [str(f).replace(" ", "") for f in (tables[0].get("fields") or [])]
+        rows = tables[0].get("data") or []
+    elif resp.get("aaData"):
+        rows = resp.get("aaData") or []
+
+    if not rows:
+        return {}
+
+    def _find_idx(must_include: Tuple[str, ...], exclude: Tuple[str, ...] = ()) -> Optional[int]:
+        for idx, col in enumerate(fields):
+            if all(m in col for m in must_include) and not any(ex in col for ex in exclude):
+                return idx
+        return None
+
+    f_idx = _find_idx(("外資及陸資", "買賣超"), ("不含", "自營商"))
+    if f_idx is None:
+        f_idx = _find_idx(("外資及陸資(不含外資自營商)", "買賣超"))
+    t_idx = _find_idx(("投信", "買賣超"))
+    d_idx = _find_idx(("自營商", "買賣超"), ("外資", "自行", "避險"))
+    tot_idx = _find_idx(("三大法人買賣超",))
+
+    day_map: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 10:
+            continue
+        code = str(row[0]).strip()
+        if not code:
+            continue
+        name_zh = str(row[1]).strip() or None
+        if f_idx is not None and t_idx is not None and tot_idx is not None:
+            f_shares = _parse_int(row[f_idx])
+            t_shares = _parse_int(row[t_idx])
+            tot_shares = _parse_int(row[tot_idx])
+            d_shares = _parse_int(row[d_idx]) if d_idx is not None else (tot_shares - f_shares - t_shares)
+        else:
+            # 欄位退回預設索引（TPEx dailyTrade 常見結構：股數）
+            f_shares = _parse_int(row[10]) if len(row) > 10 else 0
+            t_shares = _parse_int(row[13]) if len(row) > 13 else 0
+            tot_shares = _parse_int(row[-1])
+            d_shares = tot_shares - f_shares - t_shares
+        day_map[code] = {
+            "name_zh": name_zh,
+            "foreign": int(round(f_shares / 1000.0)),
+            "trust": int(round(t_shares / 1000.0)),
+            "dealer": int(round(d_shares / 1000.0)),
+            "total": int(round(tot_shares / 1000.0)),
+        }
+    return day_map
+
+
+def _fetch_tpex_inst_days(days: int = 10) -> List[Tuple[str, Dict[str, Dict[str, Any]]]]:
+    by_ymd: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    # 1. 先抓取 TPEx OpenAPI 最新一日並寫入日快取
+    try:
+        tpex_date, tpex_inst, tpex_names = _fetch_tpex_inst()
+        if tpex_inst:
+            ymd = _normalize_tpex_ymd(tpex_date)
+            merged_day = {
+                code: {**vals, "name_zh": tpex_names.get(code)}
+                for code, vals in tpex_inst.items()
+            }
+            by_ymd[ymd] = merged_day
+            day_cache = CACHE_DIR / f"tpex_inst_{ymd}.json"
+            try:
+                day_cache.parent.mkdir(parents=True, exist_ok=True)
+                day_cache.write_text(json.dumps(merged_day, ensure_ascii=False), encoding="utf-8")
+            except OSError:
+                pass
+    except Exception as exc:
+        print(f"[tw_chips_fetcher] TPEx OpenAPI 三大法人抓取失敗: {exc}", file=sys.stderr)
+
+    # 2. 讀取既有本地 tpex_inst_*.json 快取並回補不足的近 10 日交易資料
+    today = _tw_today()
+    for offset in range(25):
+        if len(by_ymd) >= days:
+            break
+        dt = today - timedelta(days=offset)
+        if dt.weekday() >= 5:
+            continue
+        ymd = dt.strftime("%Y%m%d")
+        if ymd in by_ymd:
+            continue
+
+        day_cache = CACHE_DIR / f"tpex_inst_{ymd}.json"
+        if day_cache.exists():
+            try:
+                cached_day = json.loads(day_cache.read_text(encoding="utf-8"))
+                if isinstance(cached_day, dict) and cached_day:
+                    by_ymd[ymd] = cached_day
+                    continue
+            except Exception:
+                pass
+
+        try:
+            date_param = dt.strftime("%Y/%m/%d")
+            url = (
+                "https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade"
+                f"?type=Daily&sect=EW&date={date_param}&id=&response=json"
+            )
+            parsed = _parse_tpex_daily_trade(_get_json(url, timeout=10))
+            if parsed:
+                by_ymd[ymd] = parsed
+                try:
+                    day_cache.parent.mkdir(parents=True, exist_ok=True)
+                    day_cache.write_text(json.dumps(parsed, ensure_ascii=False), encoding="utf-8")
+                except OSError:
+                    pass
+        except Exception:
+            continue
+
+    ordered_ymds = sorted(by_ymd.keys(), reverse=True)[:days]
+    return [(ymd, by_ymd[ymd]) for ymd in ordered_ymds]
+
+
+def _aggregate_inst_days(
+    days_list: List[Tuple[str, Dict[str, Dict[str, Any]]]],
+    code: str,
+) -> Tuple[Optional[Dict[str, int]], Optional[Dict[str, int]], Optional[Dict[str, int]], int, int]:
+    """將多日三大法人資料彙總為 1 日、5 日、10 日淨買超與投信連買天數。"""
+    if not days_list:
+        return None, None, None, 0, 0
+
+    raw_1d = days_list[0][1].get(code)
+    inst_1d = {k: int(raw_1d[k]) for k in ("foreign", "trust", "dealer", "total")} if raw_1d else None
+
+    def _sum_window(slice_days: List[Tuple[str, Dict[str, Dict[str, Any]]]]) -> Optional[Dict[str, int]]:
+        agg = {"foreign": 0, "trust": 0, "dealer": 0, "total": 0}
+        has_any = False
+        for _, dmap in slice_days:
+            row = dmap.get(code)
+            if row:
+                has_any = True
+                for k in ("foreign", "trust", "dealer", "total"):
+                    agg[k] += int(row.get(k) or 0)
+        return agg if has_any else None
+
+    inst_5d = _sum_window(days_list[:5])
+    inst_10d = _sum_window(days_list[:10])
+
+    streak = 0
+    for _, dmap in days_list:
+        row = dmap.get(code)
+        if row and int(row.get("trust") or 0) > 0:
+            streak += 1
+        else:
+            break
+
+    return inst_1d, inst_5d, inst_10d, streak, len(days_list)
+
+
+def load_tw_chips_snapshot(max_cache_hours: float = 12.0, t86_days: int = 10) -> Dict[str, Dict[str, Any]]:
+    """載入台股全市場（上市＋上櫃）籌碼（含近 10 日三大法人累計）與月營收快照。"""
     snapshot_path = CACHE_DIR / "tw_chips_snapshot.json"
     if snapshot_path.exists() and (time.time() - snapshot_path.stat().st_mtime) < max_cache_hours * 3600:
         try:
             cached = json.loads(snapshot_path.read_text(encoding="utf-8"))
             sample = next(iter(cached.values()), {}) if isinstance(cached, dict) else {}
-            if isinstance(sample, dict) and "name_zh" in sample:
+            if isinstance(sample, dict) and "name_zh" in sample and "institutional_10d_lots" in sample:
                 return cached
         except Exception:
             pass
@@ -273,9 +448,7 @@ def load_tw_chips_snapshot(max_cache_hours: float = 12.0, t86_days: int = 5) -> 
     twse_days: List[Tuple[str, Dict[str, Dict[str, Any]]]] = []
     twse_margin: Dict[str, Dict[str, int]] = {}
     twse_rev: Dict[str, Dict[str, Any]] = {}
-    tpex_date: Optional[str] = None
-    tpex_inst: Dict[str, Dict[str, int]] = {}
-    tpex_names: Dict[str, str] = {}
+    tpex_days: List[Tuple[str, Dict[str, Dict[str, Any]]]] = []
     tpex_margin: Dict[str, Dict[str, Any]] = {}
     tpex_rev: Dict[str, Dict[str, Any]] = {}
 
@@ -297,7 +470,7 @@ def load_tw_chips_snapshot(max_cache_hours: float = 12.0, t86_days: int = 5) -> 
         print(f"[tw_chips_fetcher] TWSE 月營收抓取失敗: {exc}", file=sys.stderr)
 
     try:
-        tpex_date, tpex_inst, tpex_names = _fetch_tpex_inst()
+        tpex_days = _fetch_tpex_inst_days(days=t86_days)
     except Exception as exc:
         print(f"[tw_chips_fetcher] TPEx 三大法人抓取失敗: {exc}", file=sys.stderr)
 
@@ -317,29 +490,8 @@ def load_tw_chips_snapshot(max_cache_hours: float = 12.0, t86_days: int = 5) -> 
     twse_codes = set(twse_latest_inst.keys()) | set(twse_margin.keys()) | set(twse_rev.keys())
     for code in twse_codes:
         raw_1d = twse_latest_inst.get(code)
-        inst_1d = {k: raw_1d[k] for k in ("foreign", "trust", "dealer", "total")} if raw_1d else None
         inst_name_zh = raw_1d.get("name_zh") if raw_1d else None
-        inst_5d = None
-        streak = 0
-        if twse_days:
-            agg = {"foreign": 0, "trust": 0, "dealer": 0, "total": 0}
-            has_any = False
-            streak_broken = False
-            for _, dmap in twse_days:
-                row = dmap.get(code)
-                if row:
-                    has_any = True
-                    for k in ("foreign", "trust", "dealer", "total"):
-                        agg[k] += row[k]
-                    if not streak_broken and row["trust"] > 0:
-                        streak += 1
-                    else:
-                        streak_broken = True
-                else:
-                    streak_broken = True
-            if has_any:
-                inst_5d = agg
-
+        inst_1d, inst_5d, inst_10d, streak, days_avail = _aggregate_inst_days(twse_days, code)
         rev_info = twse_rev.get(code, {})
         snapshot[code] = {
             "source": "TWSE",
@@ -350,26 +502,33 @@ def load_tw_chips_snapshot(max_cache_hours: float = 12.0, t86_days: int = 5) -> 
             "monthly_revenue": rev_info.get("monthly_revenue"),
             "institutional_1d_lots": inst_1d,
             "institutional_5d_lots": inst_5d,
+            "institutional_10d_lots": inst_10d,
+            "institutional_days_available": days_avail,
             "trust_buy_streak_days": streak,
             "margin": twse_margin.get(code),
         }
 
-    tpex_codes = set(tpex_inst.keys()) | set(tpex_margin.keys()) | set(tpex_rev.keys())
+    tpex_latest_inst = tpex_days[0][1] if tpex_days else {}
+    tpex_date = tpex_days[0][0] if tpex_days else None
+    tpex_codes = set(tpex_latest_inst.keys()) | set(tpex_margin.keys()) | set(tpex_rev.keys())
     for code in tpex_codes:
         if code in snapshot:
             continue
+        raw_1d = tpex_latest_inst.get(code)
+        inst_name_zh = raw_1d.get("name_zh") if raw_1d else None
+        inst_1d, inst_5d, inst_10d, streak, days_avail = _aggregate_inst_days(tpex_days, code)
         rev_info = tpex_rev.get(code, {})
-        inst_1d = tpex_inst.get(code)
-        streak = 1 if (inst_1d and inst_1d.get("trust", 0) > 0) else 0
         snapshot[code] = {
             "source": "TPEX",
             "market_board": "TPEX",
-            "name_zh": rev_info.get("name_zh") or tpex_names.get(code) or None,
+            "name_zh": rev_info.get("name_zh") or inst_name_zh or None,
             "data_date": tpex_date,
             "industry": rev_info.get("industry"),
             "monthly_revenue": rev_info.get("monthly_revenue"),
             "institutional_1d_lots": inst_1d,
-            "institutional_5d_lots": None,
+            "institutional_5d_lots": inst_5d,
+            "institutional_10d_lots": inst_10d,
+            "institutional_days_available": days_avail,
             "trust_buy_streak_days": streak,
             "margin": tpex_margin.get(code),
         }

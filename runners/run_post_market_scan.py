@@ -27,6 +27,21 @@ from adapters.tv_screener import fetch_tw_history, run_stage2_screener  # noqa: 
 from adapters.tw_chips_fetcher import fetch_tw_catalysts, is_tw_listed_or_otc, load_tw_chips_snapshot  # noqa: E402
 from core.calc_vcp_metrics import calculate_vcp_metrics  # noqa: E402
 
+_TIER_PRIORITY = {
+    "S": 3,
+    "A": 2,
+    "B": 1,
+    "C": 0,
+}
+
+_STATUS_PRIORITY = {
+    "BREAKOUT": 3,
+    "PIVOT_READY": 2,
+    "CONSOLIDATING": 1,
+    "EXTENDED": 0,
+    "NONE": 0,
+}
+
 _GRADE_PRIORITY = {
     "A_CANDIDATE": 4,
     "B_WATCHLIST": 3,
@@ -51,6 +66,80 @@ def _now_taipei() -> datetime:
     return datetime.now(tz)
 
 
+def _assign_rs_ratings(evaluated: List[Dict[str, Any]]) -> None:
+    """依各標的之相對強度原始分數計算橫斷面百分位 RS Rating (1~99)。"""
+    n = len(evaluated)
+    if n == 0:
+        return
+    if n == 1:
+        evaluated[0]["result"]["gate2_trend_rs"]["rs_rating"] = 99
+        return
+
+    ranked = sorted(
+        evaluated,
+        key=lambda x: float(x["result"]["gate2_trend_rs"].get("rs_raw_score") or 0.0),
+    )
+    for idx, item in enumerate(ranked):
+        rating = max(1, min(99, int(round(1 + (idx / (n - 1)) * 98))))
+        item["result"]["gate2_trend_rs"]["rs_rating"] = rating
+
+
+def _has_catalyst_resonance(g3: Dict[str, Any], market: str) -> bool:
+    if market == "TW":
+        inst = g3.get("institutional_10d_lots") or g3.get("institutional_5d_lots") or g3.get("institutional_1d_lots") or {}
+        if (inst.get("trust") or 0) > 0 or (inst.get("foreign") or 0) > 0:
+            return True
+        rev_yoy = (g3.get("monthly_revenue") or {}).get("yoy_pct")
+        return rev_yoy is not None and float(rev_yoy) > 15.0
+    eps_yoy = g3.get("eps_yoy_fq_pct")
+    rev_yoy = g3.get("revenue_yoy_fq_pct")
+    return (eps_yoy is not None and float(eps_yoy) > 15.0) or (rev_yoy is not None and float(rev_yoy) > 15.0)
+
+
+def _classify_vcp_tier(
+    res: Dict[str, Any],
+    market: str,
+    evaluated_count: int,
+    has_earnings_warn: bool,
+) -> str:
+    """依收縮次數、量縮程度、樞紐狀態、RS Rating 與法人／基本面共振評定 S / A / B / C 級。"""
+    g2 = res["gate2_trend_rs"]
+    g3 = res.get("gate3_catalysts") or {}
+    g4 = res["gate4_setup_risk"]
+
+    if (
+        not g2.get("stage2_template_pass")
+        or int(g4.get("distribution_days_10d", 0)) >= 3
+        or float(g4.get("dist_from_10ma_in_atr", 0.0)) > 3.5
+    ):
+        return "C"
+
+    status = str(g4.get("setup_status") or "CONSOLIDATING")
+    steps = int(g4.get("contraction_steps", 0))
+    tight_vcp = bool(g4.get("range_contracting") and g4.get("range_5d_tight")) or (
+        float(g4.get("bbw_120d_percentile", 100.0)) <= 25.0
+        and float(g4.get("atr_5_20_ratio", 1.0)) <= 0.75
+        and float(g4.get("tightness_10d_pct", 100.0)) <= 10.0
+    )
+    has_vdu = bool(g4.get("is_vdu_5d") or g4.get("is_vdu_3d") or g4.get("pocket_pivot_in_5d"))
+    rs_rating = g2.get("rs_rating")
+    rs_ok = True if (evaluated_count < 4 or rs_rating is None) else int(rs_rating) >= 75
+    resonance = _has_catalyst_resonance(g3, market)
+
+    if (
+        not has_earnings_warn
+        and rs_ok
+        and (steps >= 2 or tight_vcp)
+        and has_vdu
+        and resonance
+        and status in ("BREAKOUT", "PIVOT_READY")
+    ):
+        return "S"
+    if not has_earnings_warn and (tight_vcp or status in ("BREAKOUT", "PIVOT_READY")) and (has_vdu or resonance):
+        return "A"
+    return "B"
+
+
 def _score_candidate(result: Dict[str, Any], market: str) -> int:
     g2 = result["gate2_trend_rs"]
     g3 = result.get("gate3_catalysts") or {}
@@ -60,41 +149,74 @@ def _score_candidate(result: Dict[str, Any], market: str) -> int:
     if g2.get("stage2_template_pass"):
         score += 30
     if g2.get("rs_line_52w_high"):
-        score += 15
+        score += 12
     if g2.get("rs_above_ma50"):
-        score += 8
+        score += 6
+
+    rs_rating = g2.get("rs_rating")
+    if rs_rating is not None:
+        if int(rs_rating) >= 75:
+            score += 10
+        elif int(rs_rating) < 50:
+            score -= 10
 
     bbw_pct = float(g4.get("bbw_120d_percentile", 100.0))
     if bbw_pct <= 25.0:
-        score += 15
+        score += 12
     elif bbw_pct <= 40.0:
-        score += 6
+        score += 5
 
     atr_ratio = float(g4.get("atr_5_20_ratio", 1.0))
     if atr_ratio <= 0.75:
-        score += 12
+        score += 10
     elif atr_ratio <= 0.90:
+        score += 4
+
+    if g4.get("atr14_low_60d"):
         score += 5
 
     tight = float(g4.get("tightness_10d_pct", 100.0))
     if tight <= 10.0:
-        score += 8
+        score += 6
     elif tight <= 15.0:
-        score += 3
+        score += 2
 
-    if g4.get("is_vdu_3d") or g4.get("pocket_pivot_in_5d"):
+    if g4.get("range_contracting"):
         score += 8
+    if g4.get("range_5d_tight"):
+        score += 5
+
+    if g4.get("is_vdu_5d"):
+        score += 6
+    elif g4.get("is_vdu_3d") or g4.get("pocket_pivot_in_5d"):
+        score += 4
     if g4.get("price_above_bb_mid"):
         score += 4
+
+    status = str(g4.get("setup_status") or "")
+    if status == "BREAKOUT":
+        score += 12
+    elif status == "PIVOT_READY":
+        score += 10
 
     if int(g4.get("distribution_days_10d", 0)) >= 3:
         score -= 15
     if float(g4.get("dist_from_10ma_in_atr", 0.0)) > 3.5:
         score -= 10
 
+    adr_pct = float(g4.get("adr_20d_pct", 5.0))
+    if adr_pct < 2.0:
+        score -= 15
+    elif adr_pct > 10.0:
+        score -= 10
+
     if market == "TW":
-        inst = g3.get("institutional_5d_lots") or g3.get("institutional_1d_lots") or {}
-        if (inst.get("trust") or 0) > 0 or (inst.get("foreign") or 0) > 0:
+        inst = g3.get("institutional_10d_lots") or g3.get("institutional_5d_lots") or g3.get("institutional_1d_lots") or {}
+        trust_net = inst.get("trust") or 0
+        foreign_net = inst.get("foreign") or 0
+        if trust_net > 0 and foreign_net > 0:
+            score += 6
+        elif trust_net > 0 or foreign_net > 0:
             score += 4
         rev_yoy = (g3.get("monthly_revenue") or {}).get("yoy_pct")
         if rev_yoy is not None and float(rev_yoy) > 15.0:
@@ -112,8 +234,8 @@ def _score_candidate(result: Dict[str, Any], market: str) -> int:
 
 def run_scan(
     market: str,
-    max_candidates: int = 60,
-    focus_min: int = 5,
+    max_candidates: int = 150,
+    focus_min: int = 0,
     focus_max: int = 15,
     bars: int = 330,
 ) -> Dict[str, Any]:
@@ -176,6 +298,8 @@ def run_scan(
     if failed_count:
         print(f"[scan] 共略過/失敗 {failed_count} 檔", file=sys.stderr)
 
+    _assign_rs_ratings(evaluated)
+
     scored_items: List[Dict[str, Any]] = []
     stage2_count = 0
     vcp_tight_count = 0
@@ -193,9 +317,12 @@ def run_scan(
         if g2.get("stage2_template_pass"):
             stage2_count += 1
         if (
-            float(g4.get("bbw_120d_percentile", 100.0)) <= 25.0
-            and float(g4.get("atr_5_20_ratio", 1.0)) <= 0.75
-            and float(g4.get("tightness_10d_pct", 100.0)) <= 10.0
+            (
+                float(g4.get("bbw_120d_percentile", 100.0)) <= 25.0
+                and float(g4.get("atr_5_20_ratio", 1.0)) <= 0.75
+                and float(g4.get("tightness_10d_pct", 100.0)) <= 10.0
+            )
+            or (g4.get("range_contracting") and g4.get("range_5d_tight"))
         ):
             vcp_tight_count += 1
 
@@ -203,8 +330,9 @@ def run_scan(
         pre_grade = meta["pre_filter_grade"]
         focus_grade = pre_grade
         warnings: List[str] = []
+        has_earnings_warn = bool(g3.get("earnings_warning"))
 
-        if g3.get("earnings_warning"):
+        if has_earnings_warn:
             earnings_warning_count += 1
             warnings.append("EARNINGS_WARNING")
             focus_grade = _EARNINGS_DOWNGRADE.get(pre_grade, pre_grade)
@@ -213,12 +341,18 @@ def run_scan(
         if g1.get("benchmark_trend") == "DOWNTREND":
             warnings.append("MARKET_DOWNTREND")
 
+        vcp_tier = _classify_vcp_tier(res, market, len(evaluated), has_earnings_warn)
+        setup_status = str(g4.get("setup_status") or meta.get("setup_status") or "CONSOLIDATING")
+
         scored_items.append(
             {
                 "symbol": row["symbol"],
                 "name": row.get("name") or row["symbol"],
                 "exchange": row.get("exchange") or "",
                 "sector": row.get("sector"),
+                "vcp_tier": vcp_tier,
+                "setup_status": setup_status,
+                "rs_rating": g2.get("rs_rating"),
                 "focus_grade": focus_grade,
                 "pre_filter_grade": pre_grade,
                 "vcp_score": score,
@@ -226,31 +360,31 @@ def run_scan(
                 "close_price": meta["close_price"],
                 "suggested_pivot": g4["suggested_pivot"],
                 "suggested_stop_loss": g4["suggested_stop_loss"],
+                "tight_stop_5d_low": g4.get("tight_stop_5d_low"),
                 "stop_loss_pct": g4["stop_loss_pct"],
+                "dist_to_pivot_pct": g4.get("dist_to_pivot_pct"),
+                "target_2r": g4.get("target_2r"),
+                "target_3r": g4.get("target_3r"),
                 "vol_ma50": item["vol_ma50"],
                 "metrics": res,
             }
         )
 
-    def _sort_key(x: Dict[str, Any]) -> tuple[int, int, str]:
-        return (_GRADE_PRIORITY.get(x["focus_grade"], 0), int(x["vcp_score"]), x["symbol"])
+    def _sort_key(x: Dict[str, Any]) -> tuple[int, int, int, int, str]:
+        return (
+            _TIER_PRIORITY.get(x["vcp_tier"], 0),
+            _STATUS_PRIORITY.get(x["setup_status"], 0),
+            _GRADE_PRIORITY.get(x["focus_grade"], 0),
+            int(x["vcp_score"]),
+            x["symbol"],
+        )
 
     stage2_items = sorted(
         [x for x in scored_items if x["metrics"]["gate2_trend_rs"].get("stage2_template_pass")],
         key=_sort_key,
         reverse=True,
     )
-    other_items = sorted(
-        [x for x in scored_items if not x["metrics"]["gate2_trend_rs"].get("stage2_template_pass")],
-        key=_sort_key,
-        reverse=True,
-    )
-
-    if len(stage2_items) >= focus_min:
-        selected = stage2_items[:focus_max]
-    else:
-        need = max(0, focus_min - len(stage2_items))
-        selected = (stage2_items + other_items[:need])[:focus_max]
+    selected = stage2_items[:focus_max]
 
     if market == "US" and selected:
         us_zh_map = fetch_us_chinese_names([e["symbol"] for e in selected])
@@ -278,6 +412,9 @@ def run_scan(
             "name_zh": e.get("name_zh", ""),
             "exchange": e["exchange"],
             "sector": e["sector"],
+            "vcp_tier": e["vcp_tier"],
+            "setup_status": e["setup_status"],
+            "rs_rating": e["rs_rating"],
             "focus_grade": e["focus_grade"],
             "pre_filter_grade": e["pre_filter_grade"],
             "vcp_score": e["vcp_score"],
@@ -285,7 +422,11 @@ def run_scan(
             "close_price": e["close_price"],
             "suggested_pivot": e["suggested_pivot"],
             "suggested_stop_loss": e["suggested_stop_loss"],
+            "tight_stop_5d_low": e.get("tight_stop_5d_low"),
             "stop_loss_pct": e["stop_loss_pct"],
+            "dist_to_pivot_pct": e.get("dist_to_pivot_pct"),
+            "target_2r": e.get("target_2r"),
+            "target_3r": e.get("target_3r"),
             "vol_ma50": e["vol_ma50"],
             "metrics": e["metrics"],
         }
@@ -349,29 +490,79 @@ def _print_summary(report: Dict[str, Any]) -> None:
         f"EarningsWarn={stats['earnings_warning_count']}) → Focus List {stats['focus_count']} 檔\n"
     )
     header = (
-        f"{'#':>2}  {'Symbol':<6} {'Name':<14} {'Grade':<19} {'Score':>5} {'Close':>8} "
-        f"{'Pivot':>8} {'Stop%':>6} {'BBW%':>6} {'ATRr':>5} {'RS52H':<5} Warnings"
+        f"{'#':>2}  {'Symbol':<6} {'Name':<14} {'Tier':<4} {'Status':<13} {'Score':>5} {'RS':>3} "
+        f"{'Close':>8} {'Pivot':>8} {'Dist%':>6} {'Stop%':>6} {'BBW%':>6} {'ATRr':>5} Warnings"
     )
     print(header)
     print("-" * len(header))
     for item in report["focus_list"]:
         g2 = item["metrics"]["gate2_trend_rs"]
         g4 = item["metrics"]["gate4_setup_risk"]
-        rs52 = "YES" if g2.get("rs_line_52w_high") else "no"
+        rs_val = item.get("rs_rating") if item.get("rs_rating") is not None else g2.get("rs_rating")
+        rs_col = f"{int(rs_val):>3}" if rs_val is not None else "  -"
+        dist_val = item.get("dist_to_pivot_pct") if item.get("dist_to_pivot_pct") is not None else g4.get("dist_to_pivot_pct")
+        dist_col = f"{float(dist_val):>+6.1f}" if dist_val is not None else "     -"
+        tier_col = str(item.get("vcp_tier") or "-")
+        status_col = str(item.get("setup_status") or g4.get("setup_status") or "-")
         warns = ",".join(item["warnings"]) or "-"
         name_col = _pad_cjk(item.get("name_zh") or item.get("name") or "-", 14)
         print(
-            f"{item['rank']:>2}  {item['symbol']:<6} {name_col} {item['focus_grade']:<19} {item['vcp_score']:>5} "
-            f"{item['close_price']:>8.2f} {item['suggested_pivot']:>8.2f} {item['stop_loss_pct']:>6.2f} "
-            f"{g4['bbw_120d_percentile']:>6.1f} {g4['atr_5_20_ratio']:>5.2f} {rs52:<5} {warns}"
+            f"{item['rank']:>2}  {item['symbol']:<6} {name_col} {tier_col:<4} {status_col:<13} {item['vcp_score']:>5} {rs_col} "
+            f"{item['close_price']:>8.2f} {item['suggested_pivot']:>8.2f} {dist_col} {item['stop_loss_pct']:>6.2f} "
+            f"{g4['bbw_120d_percentile']:>6.1f} {g4['atr_5_20_ratio']:>5.2f} {warns}"
         )
+
+
+def _build_vcp_candidates_export(report: Dict[str, Any]) -> Dict[str, Any]:
+    """輸出與 vcp_candidates_YYYYMMDD.json 規範相容之扁平化候選摘要。"""
+    candidates: List[Dict[str, Any]] = []
+    for item in report.get("focus_list") or []:
+        g2 = item["metrics"]["gate2_trend_rs"]
+        g3 = item["metrics"].get("gate3_catalysts") or {}
+        g4 = item["metrics"]["gate4_setup_risk"]
+        candidates.append(
+            {
+                "rank": item["rank"],
+                "symbol": item["symbol"],
+                "name": item.get("name"),
+                "name_zh": item.get("name_zh", ""),
+                "vcp_tier": item.get("vcp_tier"),
+                "setup_status": item.get("setup_status") or g4.get("setup_status"),
+                "rs_rating": item.get("rs_rating") if item.get("rs_rating") is not None else g2.get("rs_rating"),
+                "vcp_score": item["vcp_score"],
+                "close_price": item["close_price"],
+                "pivot_price": item["suggested_pivot"],
+                "stop_loss_price": item["suggested_stop_loss"],
+                "tight_stop_5d_low": g4.get("tight_stop_5d_low"),
+                "stop_loss_pct": item["stop_loss_pct"],
+                "dist_to_pivot_pct": g4.get("dist_to_pivot_pct"),
+                "target_2r": g4.get("target_2r"),
+                "target_3r": g4.get("target_3r"),
+                "range_40d_pct": g4.get("range_40d_pct"),
+                "range_20d_pct": g4.get("range_20d_pct"),
+                "range_10d_pct": g4.get("range_10d_pct"),
+                "range_5d_pct": g4.get("range_5d_pct"),
+                "contraction_steps": g4.get("contraction_steps"),
+                "vol_ma5_to_50_ratio": g4.get("vol_ma5_to_50_ratio"),
+                "closing_range": g4.get("closing_range"),
+                "institutional_10d_lots": g3.get("institutional_10d_lots"),
+            }
+        )
+    return {
+        "generated_at": report.get("generated_at"),
+        "market": report.get("market"),
+        "benchmark_symbol": report.get("benchmark_symbol"),
+        "benchmark_trend": report.get("benchmark_trend"),
+        "funnel_stats": report.get("funnel_stats"),
+        "candidates": candidates,
+    }
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description="盤後全市場 SEPA / VCP 漏斗海選")
     p.add_argument("--market", required=True, choices=["TW", "US"])
-    p.add_argument("--max-candidates", type=int, default=60)
-    p.add_argument("--focus-min", type=int, default=5)
+    p.add_argument("--max-candidates", type=int, default=150)
+    p.add_argument("--focus-min", type=int, default=0)
     p.add_argument("--focus-max", type=int, default=15)
     p.add_argument("--bars", type=int, default=330)
     p.add_argument("--notify", action="store_true", help="海選完成後推播摘要至 Telegram")
@@ -386,18 +577,28 @@ def main() -> None:
         bars=a.bars,
     )
 
-    today_str = _now_taipei().strftime("%Y-%m-%d")
+    now = _now_taipei()
+    today_str = now.strftime("%Y-%m-%d")
+    ymd_str = now.strftime("%Y%m%d")
     watchlist_path = ROOT / "config" / "watchlists" / f"{a.market.lower()}_focus.json"
     report_path = ROOT / "data" / "reports" / f"{a.market}_scan_{today_str}.json"
+    cand_name = f"vcp_candidates_{ymd_str}.json" if a.market == "TW" else f"vcp_candidates_us_{ymd_str}.json"
+    candidates_path = ROOT / "data" / cand_name
     watchlist_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    candidates_path.parent.mkdir(parents=True, exist_ok=True)
 
     text = json.dumps(report, ensure_ascii=False, indent=2)
     watchlist_path.write_text(text, encoding="utf-8")
     report_path.write_text(text, encoding="utf-8")
+    candidates_path.write_text(
+        json.dumps(_build_vcp_candidates_export(report), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     _print_summary(report)
     print(f"\n[saved] {watchlist_path}")
+    print(f"[saved] {candidates_path}")
     print(f"[saved] {report_path}  ({time.time() - t0:.1f}s)")
 
     if a.notify:

@@ -11,6 +11,7 @@ import os
 import ssl
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -256,8 +257,15 @@ def _format_gate3_note(market: str, g3: Dict[str, Any]) -> str:
         return ""
     if market == "TW":
         parts: List[str] = []
-        inst = g3.get("institutional_5d_lots") or g3.get("institutional_1d_lots")
-        label = "5D" if g3.get("institutional_5d_lots") else "1D"
+        if g3.get("institutional_10d_lots"):
+            inst = g3["institutional_10d_lots"]
+            label = "10D"
+        elif g3.get("institutional_5d_lots"):
+            inst = g3["institutional_5d_lots"]
+            label = "5D"
+        else:
+            inst = g3.get("institutional_1d_lots")
+            label = "1D"
         if inst:
             parts.append(f"{label}投信{inst.get('trust', 0):+d}/外資{inst.get('foreign', 0):+d}張")
         rev_yoy = (g3.get("monthly_revenue") or {}).get("yoy_pct")
@@ -275,8 +283,41 @@ def _format_gate3_note(market: str, g3: Dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
-def format_post_market_summary(report: Dict[str, Any], top_n: int = 10) -> str:
-    """將盤後海選 JSON 格式化為 Telegram HTML 訊息。"""
+def _clean_symbol(symbol: str) -> str:
+    """去除交易所後綴（如 .TW / .TWO），保留乾淨股票代號。"""
+    return str(symbol or "").split(".")[0].strip()
+
+
+def _yahoo_chart_url(symbol: str, market: str, exchange: str = "") -> str:
+    """組出 Yahoo 奇摩股市技術分析連結（台股上櫃用 .TWO、上市用 .TW、美股用原代號）。"""
+    sym = _clean_symbol(symbol)
+    if str(market or "").upper() == "TW":
+        ex = str(exchange or "").strip().upper()
+        suffix = ".TWO" if ex in ("TPEX", "OTC", "TWO") else ".TW"
+        ticker = f"{sym}{suffix}"
+    else:
+        ticker = sym
+    return f"https://tw.stock.yahoo.com/quote/{urllib.parse.quote(ticker)}/technical-analysis"
+
+
+def _wantgoo_chart_url(symbol: str) -> str:
+    """組出玩股網（WantGoo）台股技術線圖連結。"""
+    sym = _clean_symbol(symbol)
+    return f"https://www.wantgoo.com/stock/{urllib.parse.quote(sym)}/technical-chart"
+
+
+def _format_symbol_links(raw_sym: str, title_label: str, market: str, exchange: str = "") -> str:
+    """組合 Telegram HTML 標的連結（標題連 Yahoo 股市技術分析；台股另附玩股網 K 線）。"""
+    yahoo_url = html.escape(_yahoo_chart_url(raw_sym, market, exchange), quote=True)
+    linked = f'<a href="{yahoo_url}"><b>{title_label}</b></a>'
+    if str(market or "").upper() == "TW":
+        wg_url = html.escape(_wantgoo_chart_url(raw_sym), quote=True)
+        linked += f' [<a href="{wg_url}">玩股K線</a>]'
+    return linked
+
+
+def format_post_market_summary(report: Dict[str, Any], top_n: Optional[int] = None) -> str:
+    """將盤後海選 JSON 格式化為 Telegram HTML 訊息（預設推送全部 Focus List 標的）。"""
     market = str(report.get("market") or "").upper()
     bm = html.escape(str(report.get("benchmark_symbol") or ""))
     trend = html.escape(str(report.get("benchmark_trend") or "UNKNOWN"))
@@ -299,11 +340,14 @@ def format_post_market_summary(report: Dict[str, Any], top_n: int = 10) -> str:
         lines.append("\n今日無符合條件標的。")
         return "\n".join(lines)
 
+    shown_items = focus_list if top_n is None else focus_list[:top_n]
     lines.append("")
-    for item in focus_list[:top_n]:
-        sym = html.escape(str(item.get("symbol") or ""))
+    for item in shown_items:
+        raw_sym = str(item.get("symbol") or "")
+        sym = html.escape(raw_sym)
         name_zh = str(item.get("name_zh") or "").strip()
         title_label = f"{sym} {html.escape(name_zh)}" if name_zh else sym
+        title_html = _format_symbol_links(raw_sym, title_label, market, str(item.get("exchange") or ""))
         grade = html.escape(str(item.get("focus_grade") or ""))
         score = item.get("vcp_score", 0)
         close_p = float(item.get("close_price") or 0.0)
@@ -317,18 +361,33 @@ def format_post_market_summary(report: Dict[str, Any], top_n: int = 10) -> str:
 
         bbw = g4.get("bbw_120d_percentile")
         bbw_str = f"BBW {float(bbw):.0f}%" if bbw is not None else "BBW -"
-        rs52 = "RS新高" if g2.get("rs_line_52w_high") else "RS-"
+        rs_rating = item.get("rs_rating") if item.get("rs_rating") is not None else g2.get("rs_rating")
+        if rs_rating is not None:
+            rs_str = f"RS{int(rs_rating)}" + ("新高" if g2.get("rs_line_52w_high") else "")
+        else:
+            rs_str = "RS新高" if g2.get("rs_line_52w_high") else "RS-"
+
+        vcp_tier = str(item.get("vcp_tier") or "").strip()
+        tier_prefix = f"{html.escape(vcp_tier)}級/" if vcp_tier else ""
+        setup_status = str(item.get("setup_status") or g4.get("setup_status") or "").strip()
+        status_badge = ""
+        if setup_status == "BREAKOUT":
+            status_badge = " 🔥BREAKOUT"
+        elif setup_status == "PIVOT_READY":
+            status_badge = " 🎯PIVOT_READY"
+        dist_p = item.get("dist_to_pivot_pct") if item.get("dist_to_pivot_pct") is not None else g4.get("dist_to_pivot_pct")
+        dist_str = f" (距Pivot {float(dist_p):+.1f}%)" if dist_p is not None else ""
         g3_note = _format_gate3_note(market, g3)
 
         row_head = (
-            f"<b>{item.get('rank', '-')}. {title_label}</b> [{grade}] {score}分 | "
-            f"收 {close_p:.2f} / Pivot {pivot:.2f} / Stop {stop_pct:.1f}% | {bbw_str} {rs52}"
+            f"<b>{item.get('rank', '-')}.</b> {title_html}{status_badge} "
+            f"[{tier_prefix}{grade}] {score}分 | 收 {close_p:.2f} / Pivot {pivot:.2f}{dist_str} / Stop {stop_pct:.1f}% | {bbw_str} {rs_str}"
         )
         lines.append(row_head)
         if g3_note:
             lines.append(f"   └ {html.escape(g3_note)}")
 
-    if len(focus_list) > top_n:
+    if top_n is not None and len(focus_list) > top_n:
         lines.append(f"\n…其餘 {len(focus_list) - top_n} 檔請見 focus.json")
 
     return "\n".join(lines)
@@ -336,10 +395,13 @@ def format_post_market_summary(report: Dict[str, Any], top_n: int = 10) -> str:
 
 def format_intraday_breakout_alert(alert: Dict[str, Any]) -> str:
     """將盤中樞紐突破觸發資料格式化為 Telegram HTML 警報卡片（供 Phase 3 雷達使用）。"""
-    sym = html.escape(str(alert.get("symbol") or ""))
-    market = html.escape(str(alert.get("market") or "TW"))
+    raw_sym = str(alert.get("symbol") or "")
+    raw_market = str(alert.get("market") or "TW")
+    sym = html.escape(raw_sym)
+    market = html.escape(raw_market)
     name_zh = str(alert.get("name_zh") or "").strip()
     title_label = f"{market}:{sym}" + (f" {html.escape(name_zh)}" if name_zh else "")
+    title_html = _format_symbol_links(raw_sym, title_label, raw_market, str(alert.get("exchange") or ""))
     last_price = float(alert.get("last_price") or 0.0)
     pivot = float(alert.get("suggested_pivot") or 0.0)
     vol_ratio = alert.get("est_vol_ratio_50d")
@@ -348,7 +410,7 @@ def format_intraday_breakout_alert(alert: Dict[str, Any]) -> str:
     stop_pct = alert.get("stop_loss_pct")
 
     lines = [
-        f"🚨 <b>[VCP 樞紐突破警報] {title_label}</b>",
+        f"🚨 <b>[VCP 樞紐突破警報]</b> {title_html}",
         f"• 現價：<b>{last_price:.2f}</b>（Pivot {pivot:.2f}）",
         f"• 預估全日量比：<b>{vol_str}</b>（50 日均量基準）",
     ]
@@ -419,30 +481,74 @@ def _run_selftest() -> None:
                 "rank": 1,
                 "symbol": "6199<TEST>&",
                 "name_zh": "天品",
-                "focus_grade": "B_OR_C_REVIEW",
-                "vcp_score": 80,
+                "vcp_tier": "S",
+                "setup_status": "PIVOT_READY",
+                "rs_rating": 92,
+                "dist_to_pivot_pct": -1.96,
+                "focus_grade": "B_WATCHLIST",
+                "vcp_score": 88,
                 "close_price": 169.5,
                 "suggested_pivot": 172.84,
                 "stop_loss_pct": -5.59,
                 "metrics": {
-                    "gate2_trend_rs": {"rs_line_52w_high": True},
+                    "gate2_trend_rs": {"rs_line_52w_high": True, "rs_rating": 92},
                     "gate3_catalysts": {
+                        "institutional_10d_lots": {"trust": 45, "foreign": 120},
                         "institutional_1d_lots": {"trust": 12, "foreign": -34},
                         "monthly_revenue": {"yoy_pct": 143.5},
                     },
-                    "gate4_setup_risk": {"bbw_120d_percentile": 35.8},
+                    "gate4_setup_risk": {"bbw_120d_percentile": 15.8},
                 },
             }
         ],
     }
     msg = format_post_market_summary(sample_report)
-    assert "&lt;TEST&gt;&amp;" in msg and "天品" in msg and "排除興櫃=1" in msg and "DOWNTREND" in msg, msg
+    assert (
+        "&lt;TEST&gt;&amp;" in msg
+        and "天品" in msg
+        and "排除興櫃=1" in msg
+        and "DOWNTREND" in msg
+        and "🎯PIVOT_READY" in msg
+        and "[S級/B_WATCHLIST]" in msg
+        and "RS92新高" in msg
+        and "距Pivot -2.0%" in msg
+        and "10D投信+45/外資+120張" in msg
+        and "https://tw.stock.yahoo.com/quote/6199%3CTEST%3E%26.TW/technical-analysis" in msg
+        and "https://www.wantgoo.com/stock/6199%3CTEST%3E%26/technical-chart" in msg
+    ), msg
+
+    many_report = {
+        **sample_report,
+        "focus_list": [
+            {**sample_report["focus_list"][0], "rank": i + 1, "symbol": str(2300 + i), "name_zh": f"股{i + 1}"}
+            for i in range(12)
+        ],
+    }
+    full_msg = format_post_market_summary(many_report)
+    assert "股12" in full_msg and "請見 focus.json" not in full_msg, full_msg
+    limited_msg = format_post_market_summary(many_report, top_n=2)
+    assert "股2" in limited_msg and "股3" not in limited_msg and "其餘 10 檔" in limited_msg, limited_msg
+
+    assert (
+        _yahoo_chart_url("NDAQ", "US", "NASDAQ")
+        == "https://tw.stock.yahoo.com/quote/NDAQ/technical-analysis"
+    )
+    assert (
+        _yahoo_chart_url("2330", "TW", "TWSE")
+        == "https://tw.stock.yahoo.com/quote/2330.TW/technical-analysis"
+    )
+    assert (
+        _yahoo_chart_url("6199.TWO", "TW", "TPEX")
+        == "https://tw.stock.yahoo.com/quote/6199.TWO/technical-analysis"
+    )
+    assert "玩股K線" not in _format_symbol_links("NDAQ", "NDAQ", "US", "NASDAQ")
 
     alert_msg = format_intraday_breakout_alert(
         {
             "symbol": "6199",
             "name_zh": "天品",
             "market": "TW",
+            "exchange": "OTC",
             "last_price": 173.5,
             "suggested_pivot": 172.84,
             "est_vol_ratio_50d": 1.65,
@@ -452,7 +558,14 @@ def _run_selftest() -> None:
             "risk_amount": 9660,
         }
     )
-    assert "6199" in alert_msg and "天品" in alert_msg and "1.65x" in alert_msg and "1,000" in alert_msg, alert_msg
+    assert (
+        "6199" in alert_msg
+        and "天品" in alert_msg
+        and "https://tw.stock.yahoo.com/quote/6199.TWO/technical-analysis" in alert_msg
+        and "https://www.wantgoo.com/stock/6199/technical-chart" in alert_msg
+        and "1.65x" in alert_msg
+        and "1,000" in alert_msg
+    ), alert_msg
 
     notifier = TelegramNotifier()
     print("PASS: _split_text (long message split under limit)")

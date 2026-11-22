@@ -74,6 +74,17 @@ def _calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
     return tr.rolling(window=period, min_periods=period).mean()
 
 
+def _window_range_pct(window_df: pd.DataFrame) -> float:
+    """計算指定區間 (High_max - Low_min) / High_max 的百分比振幅。"""
+    if window_df.empty:
+        return 0.0
+    hi = float(window_df["high"].max())
+    lo = float(window_df["low"].min())
+    if hi <= 0:
+        return 0.0
+    return round((hi - lo) / hi * 100.0, 2)
+
+
 def _detect_pocket_pivot(df: pd.DataFrame, lookback_days: int = 5) -> bool:
     """
     口袋支點（Pocket Pivot）：
@@ -178,65 +189,140 @@ def calculate_vcp_metrics(
         rs_52w_max = float(merged["rs_line"].iloc[-252:].max())
         rs_line_52w_high = bool(rs_current >= rs_52w_max * 0.995)  # 容許 0.5% 誤差視為創高/平高
         rs_above_ma50 = bool(rs_current > float(merged["rs_ma50"].iloc[-1]))
+
+        rs_windows = ((63, 0.4), (126, 0.2), (189, 0.2), (252, 0.2))
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for lookback, weight in rs_windows:
+            if len(merged) > lookback:
+                base_rs = float(merged["rs_line"].iloc[-(lookback + 1)])
+                if base_rs > 0:
+                    weighted_sum += ((rs_current / base_rs) - 1.0) * 100.0 * weight
+                    weight_total += weight
+        rs_raw_score = round(weighted_sum / weight_total, 2) if weight_total > 0 else 0.0
     else:
         rs_line_52w_high = False
         rs_above_ma50 = False
+        rs_raw_score = 0.0
 
-    # --- 3. 布林通道與壓縮量化 (BBW) ---
+    # --- 3. 布林通道與壓縮量化 (BBW 截至前一日 T-1) ---
     bb_mid = df["ma20"]
     bb_std = df["close"].rolling(20).std(ddof=0)
     bb_upper = bb_mid + 2.0 * bb_std
     bb_lower = bb_mid - 2.0 * bb_std
     bbw_series = ((bb_upper - bb_lower) / bb_mid) * 100.0
 
-    bbw_current = float(bbw_series.iloc[-1])
-    bbw_120d = bbw_series.iloc[-120:].dropna()
+    bbw_t1_series = bbw_series.iloc[:-1]
+    bbw_current = float(bbw_t1_series.iloc[-1])
+    bbw_120d = bbw_t1_series.iloc[-120:].dropna()
     bbw_120d_percentile = float((bbw_120d <= bbw_current).mean() * 100.0) if len(bbw_120d) > 0 else 50.0
     price_above_bb_mid = bool(close_price >= float(bb_mid.iloc[-1]))
 
-    # --- 4. 股性 (ADR%)、微觀緊湊度 (ATR 收斂) 與乖離 ---
+    # --- 4. 股性 (ADR%)、微觀緊湊度 (ATR 收斂截至 T-1) 與乖離 ---
     adr_20d_pct = float((((df["high"] - df["low"]) / df["low"]).rolling(20).mean().iloc[-1]) * 100.0)
-    atr_5 = float(_calc_atr(df, 5).iloc[-1])
-    atr_20 = float(_calc_atr(df, 20).iloc[-1])
-    atr_5_20_ratio = round(atr_5 / atr_20, 3) if atr_20 > 0 else 1.0
+    atr_5_series = _calc_atr(df, 5)
+    atr_20_series = _calc_atr(df, 20)
+    atr_5_t1 = float(atr_5_series.iloc[-2])
+    atr_20_t1 = float(atr_20_series.iloc[-2])
+    atr_5_20_ratio = round(atr_5_t1 / atr_20_t1, 3) if atr_20_t1 > 0 else 1.0
+    atr_20 = float(atr_20_series.iloc[-1])
+
+    atr_14_series = _calc_atr(df, 14)
+    atr14_pct_series = ((atr_14_series / df["close"]) * 100.0).iloc[:-1].dropna()
+    if len(atr14_pct_series) > 0:
+        atr14_pct_current = round(float(atr14_pct_series.iloc[-1]), 2)
+        atr14_60d = atr14_pct_series.iloc[-60:]
+        atr14_pct_60d_percentile = round(float((atr14_60d <= float(atr14_pct_series.iloc[-1])).mean() * 100.0), 2)
+    else:
+        atr14_pct_current = 0.0
+        atr14_pct_60d_percentile = 50.0
+    atr14_low_60d = bool(atr14_pct_60d_percentile <= 25.0)
 
     dist_from_10ma_in_atr = round((close_price - float(latest["ma10"])) / atr_20, 2) if atr_20 > 0 else 0.0
 
     # --- 5. 量價關係 (VDU, 口袋支點, 出貨日) ---
     vol_ma50 = float(df["volume"].rolling(50).mean().iloc[-1])
     vol_ratio_50d = round(float(latest["volume"]) / vol_ma50, 2) if vol_ma50 > 0 else 1.0
-    # 極度量縮 (VDU)：近 3 日均量低於 50 日均量的 70%
+    # 極度量縮 (VDU)：近 3 日均量低於 50 日均量的 70%，以及 T-1 窗口 Vol_MA5 < 0.60 * Vol_MA50
     recent_3d_vol_avg = float(df["volume"].iloc[-3:].mean())
     is_vdu_3d = bool(vol_ma50 > 0 and recent_3d_vol_avg < vol_ma50 * 0.70)
+    vol_ma5_t1 = float(df["volume"].iloc[-6:-1].mean())
+    vol_ma50_t1 = float(df["volume"].iloc[-51:-1].mean()) if len(df) >= 51 else vol_ma50
+    vol_ma5_to_50_ratio = round(vol_ma5_t1 / vol_ma50_t1, 3) if vol_ma50_t1 > 0 else 1.0
+    is_vdu_5d = bool(vol_ma50_t1 > 0 and vol_ma5_t1 < vol_ma50_t1 * 0.60)
 
     pocket_pivot_in_5d = _detect_pocket_pivot(df, lookback_days=5)
     dist_days_10d = _count_distribution_days(df, window=10)
 
-    # --- 6. 右側緊湊整理帶與初步 Pivot / Stop-Loss 估算 ---
-    recent_10d_high = float(df["high"].iloc[-10:].max())
-    recent_10d_low = float(df["low"].iloc[-10:].min())
-    tightness_10d_pct = round((recent_10d_high - recent_10d_low) / recent_10d_high * 100.0, 2)
+    # --- 6. 右側緊湊整理帶 (截至前一日 T-1) 與 Pivot / Stop-Loss / R:R 估算 ---
+    t1_df = df.iloc[:-1]
+    range_40d_pct = _window_range_pct(t1_df.iloc[-40:])
+    range_20d_pct = _window_range_pct(t1_df.iloc[-20:])
+    prior_10d_df = t1_df.iloc[-10:]
+    prior_10d_high = float(prior_10d_df["high"].max())
+    prior_10d_low = float(prior_10d_df["low"].min())
+    tightness_10d_pct = _window_range_pct(prior_10d_df)
+    range_10d_pct = tightness_10d_pct
+    range_5d_pct = _window_range_pct(t1_df.iloc[-5:])
+    range_contracting = bool(range_5d_pct < range_10d_pct < range_20d_pct)
+    contraction_steps = (
+        int(range_5d_pct < range_10d_pct)
+        + int(range_10d_pct < range_20d_pct)
+        + int(range_20d_pct < range_40d_pct)
+    )
+    range_5d_tight = bool(range_5d_pct <= 8.0)
 
-    # 樞紐突破價設於近 10 日高點上方約 0.2%
-    suggested_pivot = round(recent_10d_high * 1.002, 2)
-    # 停損設於近 10 日低點微幅下方，但最大不超過 Pivot 下方 8%
+    # 樞紐突破價設於前 10 日高點上方約 0.2%
+    suggested_pivot = round(prior_10d_high * 1.002, 2)
+    # 停損設於前 10 日低點微幅下方，但最大不超過 Pivot 下方 8%
     hard_stop_floor = suggested_pivot * 0.92
-    suggested_stop_loss = round(max(recent_10d_low * 0.995, hard_stop_floor), 2)
+    suggested_stop_loss = round(max(prior_10d_low * 0.995, hard_stop_floor), 2)
+    prior_5d_low = float(t1_df["low"].iloc[-5:].min())
+    tight_stop_5d_low = round(max(prior_5d_low * 0.995, hard_stop_floor), 2)
     stop_loss_pct = round((suggested_stop_loss / suggested_pivot - 1.0) * 100.0, 2)
     stop_loss_in_atr = round((suggested_pivot - suggested_stop_loss) / atr_20, 2) if atr_20 > 0 else 0.0
+    dist_to_pivot_pct = round((close_price / prior_10d_high - 1.0) * 100.0, 2) if prior_10d_high > 0 else 0.0
+    risk_per_share = max(0.01, suggested_pivot - suggested_stop_loss)
+    target_2r = round(suggested_pivot + 2.0 * risk_per_share, 2)
+    target_3r = round(suggested_pivot + 3.0 * risk_per_share, 2)
 
-    # --- 7. 系統初步評級提示 (供 AI Skill 參考與海選排序) ---
+    # --- 7. 系統初步評級與樞紐狀態 (以 T 日驗證是否放量有效突破 T-1 整理帶) ---
+    day_high = float(latest["high"])
+    day_low = float(latest["low"])
+    if day_high > day_low:
+        closing_range = round((close_price - day_low) / (day_high - day_low), 4)
+    else:
+        closing_range = 1.0 if close_price >= float(df["close"].iloc[-2]) else 0.0
+
+    is_breakout_bar = bool(
+        close_price > prior_10d_high
+        and vol_ratio_50d >= 1.5
+        and closing_range >= 0.65
+    )
+    if not stage2_pass or dist_days_10d >= 3:
+        setup_status = "NONE"
+    elif dist_from_10ma_in_atr > 3.5:
+        setup_status = "EXTENDED"
+    elif is_breakout_bar:
+        setup_status = "BREAKOUT"
+    elif -4.0 <= dist_to_pivot_pct <= 0.0:
+        setup_status = "PIVOT_READY"
+    else:
+        setup_status = "CONSOLIDATING"
+
+    vcp_tight_pass = bool(
+        (
+            (bbw_120d_percentile <= 25.0 and atr_5_20_ratio <= 0.75 and tightness_10d_pct <= 10.0)
+            or (range_contracting and range_5d_tight and (atr14_low_60d or atr_5_20_ratio <= 0.75))
+        )
+        and (is_vdu_3d or is_vdu_5d or pocket_pivot_in_5d)
+    )
+
     if not stage2_pass or dist_days_10d >= 3 or dist_from_10ma_in_atr > 3.5:
         pre_grade = "C"
-    elif (
-        bbw_120d_percentile <= 25.0
-        and atr_5_20_ratio <= 0.75
-        and tightness_10d_pct <= 10.0
-        and (is_vdu_3d or pocket_pivot_in_5d)
-    ):
-        # 若今日已放量突破則為 A 候選，否則為 B 觀察
-        is_breakout_today = close_price >= recent_10d_high * 0.995 and vol_ratio_50d >= 1.4
-        pre_grade = "A_CANDIDATE" if is_breakout_today else "B_WATCHLIST"
+    elif vcp_tight_pass:
+        # 若今日收盤突破 T-1 前 10 日高點、量比 >= 1.5x 且收盤位階 >= 0.65 (排除長上影假突破) 則為 A 候選
+        pre_grade = "A_CANDIDATE" if is_breakout_bar else "B_WATCHLIST"
     else:
         pre_grade = "B_OR_C_REVIEW"
 
@@ -249,6 +335,7 @@ def calculate_vcp_metrics(
             "benchmark_symbol": cfg.benchmark_symbol,
             "ma_mode": cfg.ma_mode_label,
             "pre_filter_grade": pre_grade,
+            "setup_status": setup_status,
         },
         "gate1_market": {
             "benchmark_above_50ma": bm_above_50,
@@ -268,6 +355,7 @@ def calculate_vcp_metrics(
             "pct_from_52w_low": round(pct_from_52w_low, 2),
             "rs_line_52w_high": rs_line_52w_high,
             "rs_above_ma50": rs_above_ma50,
+            "rs_raw_score": rs_raw_score,
         },
         "gate3_catalysts": catalysts or {"status": "NOT_PROVIDED_REQUIRE_MANUAL_OR_ADAPTER"},
         "gate4_setup_risk": {
@@ -276,18 +364,39 @@ def calculate_vcp_metrics(
             "price_above_bb_mid": price_above_bb_mid,
             "adr_20d_pct": round(adr_20d_pct, 2),
             "atr_5_20_ratio": atr_5_20_ratio,
+            "atr14_pct_current": atr14_pct_current,
+            "atr14_pct_60d_percentile": atr14_pct_60d_percentile,
+            "atr14_low_60d": atr14_low_60d,
             "tightness_10d_pct": tightness_10d_pct,
+            "range_40d_pct": range_40d_pct,
+            "range_20d_pct": range_20d_pct,
+            "range_10d_pct": range_10d_pct,
+            "range_5d_pct": range_5d_pct,
+            "range_contracting": range_contracting,
+            "contraction_steps": contraction_steps,
+            "range_5d_tight": range_5d_tight,
             "vol_ratio_50d": vol_ratio_50d,
+            "vol_ma5_to_50_ratio": vol_ma5_to_50_ratio,
+            "closing_range": round(closing_range, 3),
             "is_vdu_3d": is_vdu_3d,
+            "is_vdu_5d": is_vdu_5d,
             "pocket_pivot_in_5d": pocket_pivot_in_5d,
             "distribution_days_10d": dist_days_10d,
             "dist_from_10ma_in_atr": dist_from_10ma_in_atr,
-            "recent_10d_high": round(recent_10d_high, 2),
-            "recent_10d_low": round(recent_10d_low, 2),
+            "prior_10d_high": round(prior_10d_high, 2),
+            "prior_10d_low": round(prior_10d_low, 2),
+            "prior_5d_low": round(prior_5d_low, 2),
+            "recent_10d_high": round(prior_10d_high, 2),
+            "recent_10d_low": round(prior_10d_low, 2),
             "suggested_pivot": suggested_pivot,
             "suggested_stop_loss": suggested_stop_loss,
+            "tight_stop_5d_low": tight_stop_5d_low,
             "stop_loss_pct": stop_loss_pct,
             "stop_loss_in_atr": stop_loss_in_atr,
+            "dist_to_pivot_pct": dist_to_pivot_pct,
+            "setup_status": setup_status,
+            "target_2r": target_2r,
+            "target_3r": target_3r,
         },
     }
 
