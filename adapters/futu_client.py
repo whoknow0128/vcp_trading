@@ -16,6 +16,8 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
@@ -23,7 +25,12 @@ from typing import Any, Dict, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from .base import CACHE_DIR, cache_path, read_cache, standardize, write_cache
+from .base import CACHE_DIR, cache_path, market_post_close_cutoff, read_cache, standardize, write_cache
+
+_FUTU_CLI_LOCK = threading.Lock()
+_FUTU_LAST_CALL_TS = 0.0
+_YF_LOCK = threading.Lock()
+_YF_LAST_CALL_TS = 0.0
 
 
 def save_futu_cache(symbol: str, df: pd.DataFrame, market: str = "US") -> Path:
@@ -46,6 +53,34 @@ def _find_futu_cli() -> Optional[str]:
     if unix_bin.is_file():
         return str(unix_bin)
     return None
+
+
+def _run_futu_cli_cmd(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    """節流執行 futu CLI 避免多執行緒同時觸發 rate limit。"""
+    global _FUTU_LAST_CALL_TS
+    for attempt in range(2):
+        with _FUTU_CLI_LOCK:
+            wait = 0.35 - (time.monotonic() - _FUTU_LAST_CALL_TS)
+            if wait > 0:
+                time.sleep(wait)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+                timeout=timeout,
+            )
+            _FUTU_LAST_CALL_TS = time.monotonic()
+
+        if proc.returncode == 0:
+            return proc
+        err_text = (proc.stderr or proc.stdout or "").lower()
+        if "rate_limit" in err_text and attempt == 0:
+            time.sleep(3.0)
+            continue
+        return proc
+    return proc
 
 
 def _futu_cli_history(symbol: str, bars: int) -> pd.DataFrame:
@@ -75,14 +110,7 @@ def _futu_cli_history(symbol: str, bars: int) -> pd.DataFrame:
         if next_time is not None:
             cmd.extend(["--next-time", str(next_time)])
 
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            check=False,
-            timeout=30,
-        )
+        proc = _run_futu_cli_cmd(cmd, timeout=30)
         if proc.returncode != 0:
             raise RuntimeError((proc.stderr or proc.stdout or f"exit {proc.returncode}").strip())
 
@@ -152,17 +180,49 @@ def _futu_history(symbol: str, bars: int, host: str = "127.0.0.1", port: int = 1
 
 
 def _yf_history(symbol: str, bars: int) -> pd.DataFrame:
-    import yfinance as yf
+    global _YF_LAST_CALL_TS
+    with _YF_LOCK:
+        wait = 0.20 - (time.monotonic() - _YF_LAST_CALL_TS)
+        if wait > 0:
+            time.sleep(wait)
+        _YF_LAST_CALL_TS = time.monotonic()
 
-    df = yf.Ticker(symbol).history(period="3y", interval="1d", auto_adjust=True)
-    if df.empty:
+    try:
+        import yfinance as yf
+
+        df = yf.Ticker(symbol).history(period="3y", interval="1d", auto_adjust=True)
+        if not df.empty:
+            std = standardize(df.reset_index().rename(columns={"Date": "date", "Datetime": "date"}))
+            try:
+                write_cache(cache_path("yf_adj", "US", symbol), std)
+            except OSError:
+                pass
+            return std
+    except Exception:
+        pass
+
+    from .tv_screener import _fetch_yahoo_v8_adjusted
+
+    v8_ticker = symbol.replace(".", "-") if not symbol.startswith("^") else symbol
+    std = _fetch_yahoo_v8_adjusted(v8_ticker, bars=max(bars, 330))
+    if std.empty:
         raise RuntimeError(f"取不到美股歷史資料: {symbol}")
-    return standardize(df.reset_index().rename(columns={"Date": "date", "Datetime": "date"}))
+    try:
+        write_cache(cache_path("yf_adj", "US", symbol), std)
+    except OSError:
+        pass
+    return std
 
 
 def fetch_us_history(symbol: str, bars: int = 330, max_cache_hours: float = 12.0) -> pd.DataFrame:
+    expected_us_date, cutoff_ts = market_post_close_cutoff("US")
     futu_path = cache_path("futu", "US", symbol)
-    futu_cached = read_cache(futu_path, max_age_hours=max_cache_hours)
+    futu_cached = read_cache(
+        futu_path,
+        max_age_hours=max_cache_hours,
+        min_latest_date=expected_us_date,
+        min_mtime_ts=cutoff_ts,
+    )
     if futu_cached is not None and len(futu_cached) >= 225:
         return futu_cached.tail(bars).reset_index(drop=True)
 
@@ -172,9 +232,18 @@ def fetch_us_history(symbol: str, bars: int = 330, max_cache_hours: float = 12.0
         print(f"[futu_client] futu CLI 不可用 ({type(e).__name__}: {str(e)[:100]})", file=sys.stderr)
 
     stale_futu = read_cache(futu_path, max_age_hours=10**6)
-    if stale_futu is not None and len(stale_futu) >= 225:
-        print("[futu_client] 使用既有的 Futu 快取資料", file=sys.stderr)
+    if stale_futu is not None and len(stale_futu) >= 225 and stale_futu["date"].max().date() >= expected_us_date:
         return stale_futu.tail(bars).reset_index(drop=True)
+
+    yf_adj_path = cache_path("yf_adj", "US", symbol)
+    yf_fresh = read_cache(
+        yf_adj_path,
+        max_age_hours=max_cache_hours,
+        min_latest_date=expected_us_date,
+        min_mtime_ts=cutoff_ts,
+    )
+    if yf_fresh is not None and len(yf_fresh) >= 225:
+        return yf_fresh.tail(bars).reset_index(drop=True)
 
     try:
         df = _futu_history(symbol, bars)
@@ -182,14 +251,23 @@ def fetch_us_history(symbol: str, bars: int = 330, max_cache_hours: float = 12.0
     except Exception as e:
         print(f"[futu_client] OpenD 不可用 ({type(e).__name__}: {str(e)[:80]})", file=sys.stderr)
 
-    cached = read_cache(cache_path("tv", "US", symbol), max_age_hours=10**6)  # MCP 匯入快取
-    if cached is not None and len(cached) >= 225:
-        print("[futu_client] 使用 data/cache 內的 TradingView MCP 匯入資料", file=sys.stderr)
-        return cached.tail(bars).reset_index(drop=True)
-
-    print("[futu_client] 改用 yfinance 還原價", file=sys.stderr)
-    df = _yf_history(symbol, bars)
-    return df.tail(bars).reset_index(drop=True)
+    try:
+        print("[futu_client] 改用 Yahoo 還原價", file=sys.stderr)
+        df = _yf_history(symbol, bars)
+        return df.tail(bars).reset_index(drop=True)
+    except Exception as yf_exc:
+        if stale_futu is not None and len(stale_futu) >= 225:
+            print("[futu_client] Yahoo 失敗，改用既有 Futu 舊快取", file=sys.stderr)
+            return stale_futu.tail(bars).reset_index(drop=True)
+        cached = read_cache(cache_path("tv", "US", symbol), max_age_hours=10**6)
+        if cached is not None and len(cached) >= 225:
+            print("[futu_client] 使用 data/cache 內的 TradingView MCP 匯入資料", file=sys.stderr)
+            return cached.tail(bars).reset_index(drop=True)
+        stale_yf = read_cache(yf_adj_path, max_age_hours=10**6)
+        if stale_yf is not None and len(stale_yf) >= 225:
+            print("[futu_client] 使用既有 Yahoo 舊快取", file=sys.stderr)
+            return stale_yf.tail(bars).reset_index(drop=True)
+        raise yf_exc
 
 
 def _trading_days_until(target_date_str: Optional[str], ref_date: Optional[date] = None) -> Optional[int]:

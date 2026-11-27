@@ -27,12 +27,31 @@ def _ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-def _tw_today() -> datetime.date:
+def _tw_now() -> datetime:
     try:
         tz = ZoneInfo("Asia/Taipei")
     except ZoneInfoNotFoundError:
         tz = timezone(timedelta(hours=8))
-    return datetime.now(tz).date()
+    return datetime.now(tz)
+
+
+def _tw_today() -> datetime.date:
+    return _tw_now().date()
+
+
+def expected_tw_chips_date(now_dt: Optional[datetime] = None) -> Tuple[str, bool]:
+    """回傳台股三大法人預期最新交易日 (YYYYMMDD) 及融資融券是否應已公告。"""
+    now = now_dt if now_dt is not None else _tw_now()
+    d = now.date()
+    if d.weekday() >= 5:
+        d -= timedelta(days=d.weekday() - 4)
+        return d.strftime("%Y%m%d"), True
+    if (now.hour, now.minute) < (16, 0):
+        d -= timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d.strftime("%Y%m%d"), True
+    return d.strftime("%Y%m%d"), (now.hour, now.minute) >= (21, 0)
 
 
 def _get_json(url: str, timeout: int = 12) -> Any:
@@ -436,14 +455,33 @@ def _aggregate_inst_days(
 def load_tw_chips_snapshot(max_cache_hours: float = 12.0, t86_days: int = 10) -> Dict[str, Dict[str, Any]]:
     """載入台股全市場（上市＋上櫃）籌碼（含近 10 日三大法人累計）與月營收快照。"""
     snapshot_path = CACHE_DIR / "tw_chips_snapshot.json"
-    if snapshot_path.exists() and (time.time() - snapshot_path.stat().st_mtime) < max_cache_hours * 3600:
-        try:
-            cached = json.loads(snapshot_path.read_text(encoding="utf-8"))
-            sample = next(iter(cached.values()), {}) if isinstance(cached, dict) else {}
-            if isinstance(sample, dict) and "name_zh" in sample and "institutional_10d_lots" in sample:
-                return cached
-        except Exception:
-            pass
+    expected_ymd, margin_expected_ready = expected_tw_chips_date()
+    if snapshot_path.exists():
+        age_sec = time.time() - snapshot_path.stat().st_mtime
+        if age_sec < max_cache_hours * 3600:
+            try:
+                cached = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                sample = next(iter(cached.values()), {}) if isinstance(cached, dict) else {}
+                if isinstance(sample, dict) and "name_zh" in sample and "institutional_10d_lots" in sample:
+                    twse_sample = next(
+                        (v for v in cached.values() if isinstance(v, dict) and v.get("source") == "TWSE"),
+                        None,
+                    )
+                    tpex_sample = next(
+                        (v for v in cached.values() if isinstance(v, dict) and v.get("source") == "TPEX"),
+                        None,
+                    )
+                    twse_ok = bool(twse_sample and str(twse_sample.get("data_date") or "") >= expected_ymd)
+                    tpex_ok = bool(tpex_sample and str(tpex_sample.get("data_date") or "") >= expected_ymd)
+                    has_twse_margin = any(
+                        isinstance(v, dict) and v.get("source") == "TWSE" and v.get("margin") is not None
+                        for v in cached.values()
+                    )
+                    margin_ok = (not margin_expected_ready) or has_twse_margin
+                    if (twse_ok and tpex_ok and margin_ok) or age_sec < 900:
+                        return cached
+            except Exception:
+                pass
 
     twse_days: List[Tuple[str, Dict[str, Dict[str, Any]]]] = []
     twse_margin: Dict[str, Dict[str, int]] = {}

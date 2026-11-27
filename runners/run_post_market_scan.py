@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 import yaml  # noqa: E402
 
+from adapters.base import market_post_close_cutoff  # noqa: E402
 from adapters.futu_client import (  # noqa: E402
     _fetch_futu_quarterly_growth,
     build_us_catalysts,
@@ -24,7 +25,12 @@ from adapters.futu_client import (  # noqa: E402
     fetch_us_history,
 )
 from adapters.tv_screener import fetch_tw_history, run_stage2_screener  # noqa: E402
-from adapters.tw_chips_fetcher import fetch_tw_catalysts, is_tw_listed_or_otc, load_tw_chips_snapshot  # noqa: E402
+from adapters.tw_chips_fetcher import (  # noqa: E402
+    expected_tw_chips_date,
+    fetch_tw_catalysts,
+    is_tw_listed_or_otc,
+    load_tw_chips_snapshot,
+)
 from core.calc_vcp_metrics import calculate_vcp_metrics  # noqa: E402
 
 _TIER_PRIORITY = {
@@ -280,7 +286,8 @@ def run_scan(
     evaluated: List[Dict[str, Any]] = []
     failed_count = 0
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    max_workers = 2 if market == "US" else 4
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         future_map = {pool.submit(_process, row): row["symbol"] for row in candidates}
         for fut in as_completed(future_map):
             sym = future_map[fut]
@@ -443,6 +450,69 @@ def run_scan(
         )
     )
     now = _now_taipei()
+    expected_price_date, _ = market_post_close_cutoff(market)
+    expected_price_ymd = expected_price_date.isoformat()
+    eval_dates = [
+        str(it["result"]["meta"].get("data_date") or "")
+        for it in evaluated
+        if it["result"]["meta"].get("data_date")
+    ]
+    price_latest_date = max(eval_dates) if eval_dates else None
+    stale_price_count = sum(1 for d in eval_dates if d < expected_price_ymd)
+
+    comp_warnings: List[str] = []
+    if price_latest_date is None or price_latest_date < expected_price_ymd:
+        comp_warnings.append("PRICE_DATA_LAGGING")
+    if raw_screened_count >= 10 and failed_count / raw_screened_count > 0.25:
+        comp_warnings.append("HIGH_FAILURE_RATE")
+
+    data_completeness: Dict[str, Any] = {
+        "expected_market_date": expected_price_ymd,
+        "price_latest_date": price_latest_date,
+        "stale_price_count": stale_price_count,
+        "screened_count": raw_screened_count,
+        "calculated_count": len(evaluated),
+        "failed_count": failed_count,
+    }
+    if market == "TW":
+        expected_chips_ymd, margin_expected_ready = expected_tw_chips_date()
+        twse_dates = [
+            str(v.get("data_date") or "")
+            for v in (tw_snapshot or {}).values()
+            if isinstance(v, dict) and v.get("source") == "TWSE" and v.get("data_date")
+        ]
+        tpex_dates = [
+            str(v.get("data_date") or "")
+            for v in (tw_snapshot or {}).values()
+            if isinstance(v, dict) and v.get("source") == "TPEX" and v.get("data_date")
+        ]
+        twse_chips_date = max(twse_dates) if twse_dates else None
+        tpex_chips_date = max(tpex_dates) if tpex_dates else None
+        twse_eval = [
+            it["result"].get("gate3_catalysts") or {}
+            for it in evaluated
+            if (it["result"].get("gate3_catalysts") or {}).get("source") == "TWSE"
+        ]
+        twse_margin_ready_count = sum(1 for g3 in twse_eval if g3.get("margin") is not None)
+        if twse_chips_date is None or twse_chips_date < expected_chips_ymd:
+            comp_warnings.append("TWSE_CHIPS_LAGGING")
+        if tpex_chips_date is None or tpex_chips_date < expected_chips_ymd:
+            comp_warnings.append("TPEX_CHIPS_LAGGING")
+        if margin_expected_ready and twse_eval and twse_margin_ready_count == 0:
+            comp_warnings.append("TWSE_MARGIN_PENDING")
+        data_completeness.update(
+            {
+                "expected_chips_date": expected_chips_ymd,
+                "margin_expected_ready": margin_expected_ready,
+                "twse_chips_date": twse_chips_date,
+                "tpex_chips_date": tpex_chips_date,
+                "twse_stock_count": len(twse_eval),
+                "twse_margin_ready_count": twse_margin_ready_count,
+            }
+        )
+
+    data_completeness["warnings"] = comp_warnings
+    data_completeness["is_complete"] = len(comp_warnings) == 0
 
     return {
         "generated_at": now.isoformat(timespec="seconds"),
@@ -450,6 +520,7 @@ def run_scan(
         "benchmark_symbol": cfg["benchmark"],
         "benchmark_trend": bm_trend,
         "market_regime_warning": "BENCHMARK_DOWNTREND" if bm_trend == "DOWNTREND" else None,
+        "data_completeness": data_completeness,
         "funnel_stats": {
             "screened_count": raw_screened_count,
             "excluded_oes_count": len(excluded_oes),
@@ -480,9 +551,22 @@ def _pad_cjk(text: str, width: int) -> str:
 def _print_summary(report: Dict[str, Any]) -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     stats = report["funnel_stats"]
+    comp = report.get("data_completeness") or {}
     print(
         f"\n=== {report['market']} 盤後海選漏斗 | 大盤 {report['benchmark_symbol']}: {report['benchmark_trend']} ==="
     )
+    if comp:
+        comp_state = "OK" if comp.get("is_complete") else ",".join(comp.get("warnings") or ["INCOMPLETE"])
+        chips_note = (
+            f" | TWSE籌碼={comp.get('twse_chips_date')} TPEx籌碼={comp.get('tpex_chips_date')}"
+            f" 融資={comp.get('twse_margin_ready_count', 0)}/{comp.get('twse_stock_count', 0)}"
+            if report["market"] == "TW"
+            else ""
+        )
+        print(
+            f"[資料齊全度] {comp_state} | K線最新={comp.get('price_latest_date')} "
+            f"(預期={comp.get('expected_market_date')}) | 失敗={stats.get('failed_count', 0)}{chips_note}"
+        )
     oes_info = f", 排除興櫃={stats.get('excluded_oes_count', 0)}" if report["market"] == "TW" else ""
     print(
         f"初篩 {stats['screened_count']} → 精算成功 {stats['calculated_count']} "

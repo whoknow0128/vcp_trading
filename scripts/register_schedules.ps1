@@ -18,28 +18,37 @@ $Tasks = @(
         Arguments   = "-m runners.run_post_market_scan --market US --notify"
     },
     @{
-        Name        = "VCP_TW_PostMarket_1530"
-        Description = "TW Post-Market SEPA/VCP Scan at 15:30 (Mon-Fri Asia/Taipei)"
-        Time        = "15:30"
+        Name        = "VCP_TW_PostMarket_2115"
+        Description = "TW Post-Market SEPA/VCP Scan at 21:15 (Mon-Fri Asia/Taipei; after TWSE T86 and margin)"
+        Time        = "21:15"
         DaysOfWeek  = @("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
         Arguments   = "-m runners.run_post_market_scan --market TW --notify"
     }
 )
+$LegacyTasks = @("VCP_TW_PostMarket_1530")
 
 if (-not $Register -and -not $Unregister) {
     $DryRun = $true
 }
 
 if ($Unregister) {
-    foreach ($t in $Tasks) {
+    foreach ($name in ($Tasks.Name + $LegacyTasks)) {
         if ($DryRun) {
-            Write-Host "[DRY-RUN] Unregister-ScheduledTask -TaskName $($t.Name) -Confirm:`$false"
+            Write-Host "[DRY-RUN] Unregister-ScheduledTask -TaskName $name -Confirm:`$false"
         } else {
-            Unregister-ScheduledTask -TaskName $t.Name -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Host "[Unregistered] $($t.Name)"
+            Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Host "[Unregistered] $name"
         }
     }
     exit 0
+}
+
+foreach ($oldName in $LegacyTasks) {
+    if ($DryRun) {
+        Write-Host "[DRY-RUN] Cleanup Legacy Task: $oldName"
+    } else {
+        Unregister-ScheduledTask -TaskName $oldName -Confirm:$false -ErrorAction SilentlyContinue
+    }
 }
 
 foreach ($t in $Tasks) {

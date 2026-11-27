@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 
-from .base import CACHE_DIR, cache_path, read_cache, standardize, write_cache
+from .base import CACHE_DIR, cache_path, market_post_close_cutoff, read_cache, standardize, write_cache
 
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
@@ -126,7 +126,13 @@ def fetch_tw_history(
     max_cache_hours: float = 12.0,
 ) -> pd.DataFrame:
     adj_path = cache_path("yf_adj", "TW", symbol)
-    fresh = read_cache(adj_path, max_age_hours=max_cache_hours)
+    expected_tw_date, cutoff_ts = market_post_close_cutoff("TW")
+    fresh = read_cache(
+        adj_path,
+        max_age_hours=max_cache_hours,
+        min_latest_date=expected_tw_date,
+        min_mtime_ts=cutoff_ts,
+    )
     if fresh is not None and len(fresh) >= 265:
         return fresh.tail(bars).reset_index(drop=True)
 

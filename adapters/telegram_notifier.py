@@ -329,6 +329,22 @@ def format_post_market_summary(report: Dict[str, Any], top_n: Optional[int] = No
     if trend == "DOWNTREND":
         lines.append("⚠️ 逆風空頭環境，提高突破門檻")
 
+    comp = report.get("data_completeness") or {}
+    comp_warns = comp.get("warnings") or []
+    if comp_warns:
+        warn_parts = []
+        if "TWSE_CHIPS_LAGGING" in comp_warns:
+            warn_parts.append(f"TWSE籌碼僅至{comp.get('twse_chips_date') or '-'}")
+        if "TPEX_CHIPS_LAGGING" in comp_warns:
+            warn_parts.append(f"TPEx籌碼僅至{comp.get('tpex_chips_date') or '-'}")
+        if "TWSE_MARGIN_PENDING" in comp_warns:
+            warn_parts.append("TWSE融資融券尚未公布")
+        if "PRICE_DATA_LAGGING" in comp_warns:
+            warn_parts.append(f"K線僅至{comp.get('price_latest_date') or '-'}")
+        if "HIGH_FAILURE_RATE" in comp_warns:
+            warn_parts.append(f"失敗率偏高({comp.get('failed_count', 0)}/{comp.get('screened_count', 0)})")
+        lines.append("⚠️ 資料齊全度警示：" + "、".join(warn_parts or comp_warns))
+
     oes_part = f"，排除興櫃={stats.get('excluded_oes_count', 0)}" if market == "TW" else ""
     lines.append(
         f"初篩 {stats.get('screened_count', 0)} → 精算 {stats.get('calculated_count', 0)}"
@@ -516,6 +532,19 @@ def _run_selftest() -> None:
         and "https://tw.stock.yahoo.com/quote/6199%3CTEST%3E%26.TW/technical-analysis" in msg
         and "https://www.wantgoo.com/stock/6199%3CTEST%3E%26/technical-chart" in msg
     ), msg
+
+    comp_report = {
+        **sample_report,
+        "data_completeness": {
+            "is_complete": False,
+            "twse_chips_date": "20261126",
+            "failed_count": 0,
+            "screened_count": 20,
+            "warnings": ["TWSE_CHIPS_LAGGING", "TWSE_MARGIN_PENDING"],
+        },
+    }
+    comp_msg = format_post_market_summary(comp_report)
+    assert "TWSE籌碼僅至20261126" in comp_msg and "TWSE融資融券尚未公布" in comp_msg, comp_msg
 
     many_report = {
         **sample_report,
